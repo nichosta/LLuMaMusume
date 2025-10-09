@@ -1,0 +1,17 @@
+pyautogui
+pygetwindow
+mss
+pillow
+numpy
+google-genai
+pyyaml
+
+# Optional (uncomment as needed)
+# keyboard
+# pynput
+# orjson
+# tenacity
+# opencv-python-headless
+# scikit-image
+# ImageHash
+# pytesseract
