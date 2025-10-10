@@ -7,7 +7,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 # Environment
 
 - OS: Windows 11 24H2 (64-bit)
-- Python: 3.14.0 (x64)
+- Python: 3.14.0 (x64), uv for package management.
 - Display: 2560×1600 (single monitor recommended; display scaling TBD — recommend 100%)
 - Game: Uma Musume Pretty Derby (Steam)
 - Game mode: Windowed (in-game resolution TBD; document after testing)
