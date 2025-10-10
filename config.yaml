@@ -1,0 +1,8 @@
+window:
+  client_offset: [6, 30]
+capture:
+  split:
+    left_pin_px: 133
+    ratios:
+      primary: 0.42126
+      menus: 0.5
