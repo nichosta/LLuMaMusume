@@ -10,10 +10,11 @@ from pathlib import Path
 from PIL import Image
 
 from lluma_vision import MenuAnalyzer
-from lluma_vision.menu_analyzer import TabAvailability
+from lluma_vision.menu_analyzer import ScrollbarInfo, TabAvailability
 
 DATA_DIR = Path(__file__).parent / "data" / "menu_captures"
 MENU_SECTION_START_RATIO = 0.5  # menus occupy the right half of the capture
+PRIMARY_SCROLLBAR_DIR = Path(__file__).parent / "data" / "primary_scrollbars"
 
 
 class MenuVisionRegressionTest(unittest.TestCase):
@@ -126,6 +127,44 @@ class MenuVisionRegressionTest(unittest.TestCase):
             decoded = base64.b64decode(encoded)
             with Image.open(io.BytesIO(decoded)) as trimmed:
                 self.assertEqual(trimmed.size, (85, 40))
+
+    def test_detect_primary_scrollbar_samples(self) -> None:
+        """Validate scrollbar heuristics against reference captures."""
+
+        # No scrollbar present
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-161528-primary.png") as image:
+            result = self.analyzer.detect_primary_scrollbar(image)
+        self.assertIsNone(result)
+
+        # Scrollbar near the bottom with travel remaining in both directions
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-184452-primary.png") as image:
+            result = self.analyzer.detect_primary_scrollbar(image)
+
+        self.assertIsInstance(result, ScrollbarInfo)
+        assert result is not None  # help type checkers
+        self.assertGreater(result.track_bounds[0], 880)
+        self.assertLess(result.track_bounds[0], 940)
+        self.assertTrue(result.can_scroll_up)
+        self.assertTrue(result.can_scroll_down)
+        self.assertAlmostEqual(result.thumb_ratio, 0.66, delta=0.05)
+        self.assertGreater(result.thumb_bounds[3], 200)
+
+        # Scrollbar positioned near the very top but still scrollable downward
+        for filename in [
+            "20251011-185948-primary.png",
+            "20251011-185959-primary.png",
+        ]:
+            with Image.open(PRIMARY_SCROLLBAR_DIR / filename) as image:
+                scroll = self.analyzer.detect_primary_scrollbar(image)
+
+            self.assertIsInstance(scroll, ScrollbarInfo)
+            assert scroll is not None
+            self.assertGreater(scroll.track_bounds[0], 900)
+            self.assertLess(scroll.track_bounds[0], 940)
+            self.assertLess(scroll.track_bounds[3], 1500)
+            self.assertLess(scroll.thumb_ratio, 0.15)
+            self.assertGreater(scroll.thumb_bounds[3], 40)
+            self.assertTrue(scroll.can_scroll_down)
 
 
 if __name__ == "__main__":  # pragma: no cover - allows direct invocation

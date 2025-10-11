@@ -51,7 +51,7 @@ Capture specifics
 - Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png` and `captures/<turn_id>-menus.png` when split is enabled.
 - Retention: Keep the last N turns (configurable, e.g., 200) and clean older files on startup.
 - Occlusion: We rely on focus + top-level z-order; per-window capture is not used. If occluded content is suspected (e.g., unexpected uniform regions), abort the turn.
-- Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is determined by local image heuristics (to be implemented).
+- Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is derived from local heuristics that examine the rightmost ~220 px band for the mauve/grey track and thumb.
 
 Menu content nuances
 - Sparks, Log, and Career Profile tabs rarely expose dedicated buttons; when these are the selected tab, pass the raw menu crop to the agent instead of the (likely empty) button list so it can rely on direct OCR.

@@ -37,12 +37,23 @@ class TabInfo:
     availability: TabAvailability
 
 
-@dataclass(slots=True) 
+@dataclass(slots=True)
 class MenuState:
     """Complete menu state analysis result."""
     is_usable: bool  # False if blurred/inactive
     selected_tab: Optional[str]
     tabs: List[TabInfo]
+
+
+@dataclass(slots=True)
+class ScrollbarInfo:
+    """Describes a detected vertical scrollbar in the primary view."""
+
+    track_bounds: tuple[int, int, int, int]  # x, y, width, height
+    thumb_bounds: tuple[int, int, int, int]  # x, y, width, height
+    can_scroll_up: bool
+    can_scroll_down: bool
+    thumb_ratio: float  # 0.0 (top) → 1.0 (bottom)
 
 
 class MenuAnalyzer:
@@ -59,6 +70,17 @@ class MenuAnalyzer:
         "Menu"
     ]
     LEFT_TRIM_RATIO = 0.15  # proportion of image width trimmed from the left before VLM calls
+    PRIMARY_SCROLLBAR_BAND_WIDTH = 220  # width of primary-image band used for scrollbar detection
+    SCROLLBAR_MIN_WIDTH = 8
+    SCROLLBAR_MAX_WIDTH = 16
+    SCROLLBAR_SEARCH_WIDTH = 160  # search only within this many pixels of the right edge
+    SCROLLBAR_MIN_EDGE_STRENGTH = 5.0
+    SCROLLBAR_SMOOTH_KERNEL = 9
+    SCROLLBAR_THUMB_DELTA = 28.0
+    SCROLLBAR_MIN_THUMB_RATIO = 0.02
+    SCROLLBAR_MIN_THUMB_PIXELS = 20
+    SCROLLBAR_END_MARGIN_RATIO = 0.015
+    SCROLLBAR_END_MARGIN_MIN = 10
 
     def __init__(self, logger: Optional[Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
@@ -375,6 +397,109 @@ class MenuAnalyzer:
 
         return self._parse_buttons_payload(content)
 
+    def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
+        """Heuristically detect a vertical scrollbar within a primary capture."""
+
+        arr = np.asarray(primary_image, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            self._logger.debug("Primary image lacks expected RGB channels; skipping scrollbar detection")
+            return None
+
+        height, width, _ = arr.shape
+        if width < 2:
+            return None
+
+        band_width = min(self.PRIMARY_SCROLLBAR_BAND_WIDTH, width)
+        band = arr[:, width - band_width :, :]
+
+        # Compute luma channel for gradient/variance analysis
+        luma = 0.2126 * band[:, :, 0] + 0.7152 * band[:, :, 1] + 0.0722 * band[:, :, 2]
+        if luma.shape[1] < 2:
+            return None
+
+        gradients = np.abs(np.diff(luma, axis=1))
+        mean_grad = gradients.mean(axis=0)
+        grad_threshold = float(mean_grad.mean() + mean_grad.std())
+        edge_candidates = [idx for idx, value in enumerate(mean_grad) if value >= grad_threshold]
+
+        if not edge_candidates:
+            return None
+
+        best_candidate: Optional[tuple[float, int, int, float]] = None
+        for left_edge in edge_candidates:
+            for right_edge in edge_candidates:
+                if right_edge <= left_edge:
+                    continue
+
+                window_width = right_edge - left_edge
+                if not (self.SCROLLBAR_MIN_WIDTH <= window_width <= self.SCROLLBAR_MAX_WIDTH):
+                    continue
+
+                global_left = width - band_width + left_edge
+                if global_left < width - self.SCROLLBAR_SEARCH_WIDTH:
+                    continue
+
+                edge_strength = float(mean_grad[left_edge] + mean_grad[right_edge - 1])
+                if edge_strength < self.SCROLLBAR_MIN_EDGE_STRENGTH:
+                    continue
+
+                window = luma[:, left_edge:right_edge]
+                inside_std = float(np.std(window))
+                score = inside_std / (edge_strength + 1e-6)
+
+                if best_candidate is None or score < best_candidate[0]:
+                    best_candidate = (score, left_edge, right_edge, edge_strength)
+
+        if best_candidate is None:
+            return None
+
+        _, left_idx, right_idx, edge_strength = best_candidate
+        track_x0 = width - band_width + left_idx
+        track_x1 = width - band_width + right_idx
+
+        window = luma[:, left_idx:right_idx]
+        row_mean = window.mean(axis=1)
+
+        # Smooth to reduce row-level noise
+        kernel = np.ones(self.SCROLLBAR_SMOOTH_KERNEL, dtype=np.float32) / self.SCROLLBAR_SMOOTH_KERNEL
+        smooth = np.convolve(row_mean, kernel, mode="same")
+
+        bright_reference = float(np.percentile(smooth, 80))
+        thumb_threshold = bright_reference - self.SCROLLBAR_THUMB_DELTA
+
+        mask = smooth <= thumb_threshold
+        min_thumb_span = max(
+            self.SCROLLBAR_MIN_THUMB_PIXELS,
+            int(height * self.SCROLLBAR_MIN_THUMB_RATIO),
+        )
+
+        thumb_segment = self._largest_segment(mask, min_thumb_span)
+        if thumb_segment is None:
+            self._logger.debug("Detected scrollbar track but no thumb segment matched thresholds")
+            return None
+
+        thumb_top, thumb_bottom = thumb_segment
+        track_width = track_x1 - track_x0
+        thumb_height = thumb_bottom - thumb_top + 1
+
+        margin = max(self.SCROLLBAR_END_MARGIN_MIN, int(height * self.SCROLLBAR_END_MARGIN_RATIO))
+        can_scroll_up = thumb_top > margin
+        can_scroll_down = thumb_bottom < (height - margin)
+
+        thumb_center = (thumb_top + thumb_bottom) / 2.0
+        thumb_ratio = float(np.clip(thumb_center / max(height - 1, 1), 0.0, 1.0))
+
+        track_bounds = (int(track_x0), 0, int(track_width), int(height))
+        thumb_bounds = (int(track_x0), int(thumb_top), int(track_width), int(thumb_height))
+
+        return ScrollbarInfo(
+            track_bounds=track_bounds,
+            thumb_bounds=thumb_bounds,
+            can_scroll_up=can_scroll_up,
+            can_scroll_down=can_scroll_down,
+            thumb_ratio=thumb_ratio,
+        )
+
     def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> str:
         """Load, trim, and encode the image region sent to the VLM."""
 
@@ -397,6 +522,30 @@ class MenuAnalyzer:
 
         cropped = image.crop((trim_px, 0, width, height))
         return cropped.copy()
+
+    def _largest_segment(self, mask: np.ndarray, min_length: int) -> Optional[tuple[int, int]]:
+        """Return the longest contiguous True segment meeting the minimum length."""
+
+        best: Optional[tuple[int, int]] = None
+        start: Optional[int] = None
+
+        for idx, value in enumerate(mask):
+            if value and start is None:
+                start = idx
+            elif not value and start is not None:
+                end = idx - 1
+                if end - start + 1 >= min_length:
+                    if best is None or (end - start) > (best[1] - best[0]):
+                        best = (start, end)
+                start = None
+
+        if start is not None:
+            end = len(mask) - 1
+            if end - start + 1 >= min_length:
+                if best is None or (end - start) > (best[1] - best[0]):
+                    best = (start, end)
+
+        return best
 
     def _get_openrouter_client(self) -> Any:
         """Initialise a cached OpenRouter client."""
