@@ -7,7 +7,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 # Environment
 
 - OS: Windows 11 24H2 (64-bit)
-- Python: 3.14.0 (x64), uv for package management.
+- Python: 3.13.8 (x64), uv for package management.
 - Display: 2560×1600 (single monitor recommended; display scaling TBD — recommend 100%)
 - Game: Uma Musume Pretty Derby (Steam)
 - Game mode: Windowed (in-game resolution TBD; document after testing)
@@ -51,10 +51,15 @@ Capture specifics
 - Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png` and `captures/<turn_id>-menus.png` when split is enabled.
 - Retention: Keep the last N turns (configurable, e.g., 200) and clean older files on startup.
 - Occlusion: We rely on focus + top-level z-order; per-window capture is not used. If occluded content is suspected (e.g., unexpected uniform regions), abort the turn.
+- Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is derived from local heuristics that examine the rightmost ~220 px band for the mauve/grey track and thumb.
+
+Menu content nuances
+- Sparks, Log, and Career Profile tabs rarely expose dedicated buttons; when these are the selected tab, pass the raw menu crop to the agent instead of the (likely empty) button list so it can rely on direct OCR.
+- For all other tabs, provide the structured button list emitted by the VLM in addition to the image.
 
 # Vision
 
-Handles processing the images into broadly usable structured data. Image processing proceeds in multiple steps; splicing the image (the gameplay screen is easily split into two parts, Primary and Menus), processing out inactive buttons and content, and finally Gemini Image Understanding with Gemini 2.5 Flash to return named bounding boxes for interactable buttons (to be used to inform the model of available tool calls, and to process those tool calls into mouse and keyboard actions).
+Handles processing the images into broadly usable structured data. Image processing proceeds in multiple steps; splicing the image (the gameplay screen is easily split into two parts, Primary and Menus), processing out inactive buttons and content, and finally VLM Image Understanding via OpenRouter to return named bounding boxes for interactable buttons (to be used to inform the model of available tool calls, and to process those tool calls into mouse and keyboard actions).
 
 The raw screenshot (most likely only the Primary side) is also handed to the agent alongsize the processed data, under the assumption that its vision is enough for OCR (in visual novel dialogue and pop-ups).
 
@@ -65,30 +70,29 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
   - Optional masking: exclude the left-side pin strip region from detection (configured via `split.left_pin_ratio`).
   - Normalization: apply light denoise and brightness/contrast normalization to stabilize detection; do not alter geometry.
 
-- Gemini detection mode
+- VLM detection mode
   - Use object detection that returns `box_2d: [ymin, xmin, ymax, xmax]` and `label: string` with coordinates normalized to 0–1000 relative to the input image.
   - No native confidence provided; when feasible, request that the model appends an approximate confidence to the `label` (see label encoding). Treat it as advisory only.
 
 - Label encoding (single string parsed by the harness)
-  - Format: `name|section=primary|state=active|type=button|hint=...|conf=0.0-1.0`
-  - Required: `name`, `section` (primary|menus), `state` (active|inactive|hidden|locked), `type` (button|hotspot|overlay)
-  - Optional: `hint` (brief text like unlock reason), `conf` (if provided by the model)
+  - Format: `name` followed by optional metadata tags like `|section=menus` or `|hint=New`.
+  - Required: button name; metadata tags are optional and only used when they add meaningful context.
   - Escaping: replace `|` with `\|` and `=` with `\=` inside values.
 
-- Output records (constructed by the harness from Gemini outputs)
-  - `buttons`: list of { `name`, `bounds` (client logical px: x,y,w,h), `state`, `section`, `type` }
-  - `hotspots`: named regions like `dialogue_center`, `confirm_ok`, etc., same bounds convention
-  - `overlays`: detected UI states such as `tutorial_overlay`, `modal_dialog`, `loading_mask`
-  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_ratio` }
+- Output records (constructed by the harness from VLM outputs)
+  - `buttons`: list of { `name`, `bounds` (client logical px: x,y,w,h), optional `section`/`hint` }.
+  - `hotspots`: named regions like `dialogue_center`, `confirm_ok`, etc., same bounds convention.
+  - `overlays`: detected UI states such as `tutorial_overlay`, `modal_dialog`, `loading_mask`.
+  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_ratio` }.
 
 - Coordinate conversion
-  - Gemini provides normalized coords per input image (full or crop). Convert to crop pixels, then to client logical px.
+  - The VLM provides normalized coords per input image (full or crop). Convert to crop pixels, then to client logical px.
   - Steps: `crop_px = norm/1000 * crop_size_px` → `screen_px = crop_px + crop_origin_screen` → `client_logical_px = round(screen_px / scaling_factor)`.
   - If a left pin strip is cropped (based on `left_pin_ratio`), add its width to the X-origin before back-projection.
 
 - Inactive/disabled UI handling
   - Heuristics: look for blur, darkening, greyed text, lock icons, and unlock-condition text; encode as `state=inactive|locked` with a brief `hint` where possible.
-  - Avoid hardcoding thresholds; rely on Gemini and qualitative cues in the prompt. Expect manual image testing to refine instructions.
+  - Avoid hardcoding thresholds; rely on the VLM and qualitative cues in the prompt. Expect manual image testing to refine instructions.
 
 - Empty/low-signal frames
   - If zero `buttons` are detected on both `Primary` and `Menus`, classify likely states:
@@ -243,12 +247,12 @@ Structured logs aid debugging and reproducibility without exposing sensitive dat
 
 # Setup & Dependencies
 
-Install Python 3.14.0 (x64), then install dependencies via `pip install -r requirements.txt`.
+Install Python 3.13.8 (x64), then install dependencies via `pip install -r requirements.txt`.
 
 - Confirmed runtime deps
   - OS I/O: `pyautogui`, `pygetwindow`, `mss`
   - Imaging: `pillow`, `numpy`
-  - Agent/VLM: `google-generativeai`
+  - Agent/VLM: `openrouter`
   - Config: `pyyaml`
 
 - Provisional deps (enable if/when needed)
@@ -258,6 +262,6 @@ Install Python 3.14.0 (x64), then install dependencies via `pip install -r requi
   - Image processing extras: `opencv-python-headless`, `scikit-image`, `ImageHash`, `pytesseract`
 
 Environment
-- Set `GEMINI_API_KEY` in the environment for Vision calls.
+- Set `OPENROUTER_API_KEY` in the environment for Vision calls.
 - Ensure Steam window title is exactly `Umamusume`.
 - First-run checklist: verify window placement (0,0 @ 1920×1080), confirm capture works, adjust split ratios as needed.

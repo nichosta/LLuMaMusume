@@ -1,16 +1,20 @@
 """Regression tests for the menu vision analyzer."""
 from __future__ import annotations
 
+import base64
+import io
+import tempfile
 import unittest
 from pathlib import Path
 
 from PIL import Image
 
-from lluma_vision import MenuAnalyzer
-from lluma_vision.menu_analyzer import TabAvailability
+from lluma_vision import MenuAnalyzer, MenuState, TabAvailability
+from lluma_vision.menu_analyzer import ScrollbarInfo, TabInfo
 
 DATA_DIR = Path(__file__).parent / "data" / "menu_captures"
 MENU_SECTION_START_RATIO = 0.5  # menus occupy the right half of the capture
+PRIMARY_SCROLLBAR_DIR = Path(__file__).parent / "data" / "primary_scrollbars"
 
 
 class MenuVisionRegressionTest(unittest.TestCase):
@@ -32,18 +36,21 @@ class MenuVisionRegressionTest(unittest.TestCase):
 
     def test_reference_captures(self) -> None:
         test_cases = [
+            # Tab is career profile, top 4 tabs are enabled, bottom 4 tabs are disabled
             {
                 "file": "career profile, bottom 3 disabled.png",
                 "expected_usable": True,
                 "expected_selected": "Career Profile",
                 "expected_available": ["Jukebox", "Sparks", "Log", "Career Profile"],
             },
+            # Tab is menu, all buttons in tab window are active, only topmost and bottommost tabs are selectable
             {
                 "file": "menu, all active.png",
                 "expected_usable": True,
                 "expected_selected": "Menu",
                 "expected_available": ["Jukebox", "Menu"],
             },
+            # Tab is menu, but the entire image is blurred, indicating unusability
             {
                 "file": "menu, all blurred.png",
                 "expected_usable": False,
@@ -70,6 +77,107 @@ class MenuVisionRegressionTest(unittest.TestCase):
                     if tab.availability == TabAvailability.AVAILABLE
                 ]
                 self.assertCountEqual(available_tabs, case["expected_available"])
+
+    def test_parse_buttons_payload_normalises_values(self) -> None:
+        analyzer = MenuAnalyzer()
+
+        payload = """```json
+        {
+            "buttons": [
+                {
+                    "label": "Start|section=menus|state=active|type=button|conf=0.9",
+                    "box_2d": [-10, 50, "100", 1205]
+                }
+            ]
+        }
+        ```"""
+
+        parsed = analyzer._parse_buttons_payload(payload)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["label"], "Start|section=menus|state=active|type=button|conf=0.9")
+        self.assertEqual(parsed[0]["box_2d"], [0.0, 50.0, 100.0, 1000.0])
+
+    def test_parse_buttons_payload_accepts_dict_response(self) -> None:
+        analyzer = MenuAnalyzer()
+
+        payload = """
+        {
+            "buttons": [
+                {"label": "Enter", "box_2d": [10, 20, 200, 220]}
+            ]
+        }
+        """
+
+        parsed = analyzer._parse_buttons_payload(payload)
+
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["label"], "Enter")
+        self.assertEqual(parsed[0]["box_2d"], [10.0, 20.0, 200.0, 220.0])
+
+    def test_menu_state_available_tabs_helper(self) -> None:
+        state = MenuState(
+            is_usable=True,
+            selected_tab="Menu",
+            tabs=[
+                TabInfo("Jukebox", False, TabAvailability.AVAILABLE),
+                TabInfo("Sparks", False, TabAvailability.UNAVAILABLE),
+                TabInfo("Menu", True, TabAvailability.AVAILABLE),
+            ],
+        )
+
+        self.assertListEqual(state.available_tabs(), ["Jukebox", "Menu"])
+
+    def test_prepare_api_image_trims_left_region(self) -> None:
+        analyzer = MenuAnalyzer()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "source.png"
+            source = Image.new("RGB", (100, 40), color=(255, 0, 0))
+            source.save(path)
+
+            encoded = analyzer._prepare_api_image(path, trim_left_ratio=MenuAnalyzer.LEFT_TRIM_RATIO)
+            decoded = base64.b64decode(encoded)
+            with Image.open(io.BytesIO(decoded)) as trimmed:
+                self.assertEqual(trimmed.size, (85, 40))
+
+    def test_detect_primary_scrollbar_samples(self) -> None:
+        """Validate scrollbar heuristics against reference captures."""
+
+        # No scrollbar present
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-161528-primary.png") as image:
+            result = self.analyzer.detect_primary_scrollbar(image)
+        self.assertIsNone(result)
+
+        # Scrollbar near the bottom with travel remaining in both directions
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-184452-primary.png") as image:
+            result = self.analyzer.detect_primary_scrollbar(image)
+
+        self.assertIsInstance(result, ScrollbarInfo)
+        assert result is not None  # help type checkers
+        self.assertGreater(result.track_bounds[0], 880)
+        self.assertLess(result.track_bounds[0], 940)
+        self.assertTrue(result.can_scroll_up)
+        self.assertTrue(result.can_scroll_down)
+        self.assertAlmostEqual(result.thumb_ratio, 0.66, delta=0.05)
+        self.assertGreater(result.thumb_bounds[3], 200)
+
+        # Scrollbar positioned near the very top but still scrollable downward
+        for filename in [
+            "20251011-185948-primary.png",
+            "20251011-185959-primary.png",
+        ]:
+            with Image.open(PRIMARY_SCROLLBAR_DIR / filename) as image:
+                scroll = self.analyzer.detect_primary_scrollbar(image)
+
+            self.assertIsInstance(scroll, ScrollbarInfo)
+            assert scroll is not None
+            self.assertGreater(scroll.track_bounds[0], 900)
+            self.assertLess(scroll.track_bounds[0], 940)
+            self.assertLess(scroll.track_bounds[3], 1500)
+            self.assertLess(scroll.thumb_ratio, 0.15)
+            self.assertGreater(scroll.thumb_bounds[3], 40)
+            self.assertTrue(scroll.can_scroll_down)
 
 
 if __name__ == "__main__":  # pragma: no cover - allows direct invocation

@@ -3,5 +3,5 @@ name = "llumamusume"
 version = "0.1.0"
 description = "Experimental harness for Uma Musume gameplay on Windows by an LLM agent."
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.13"
 dependencies = []

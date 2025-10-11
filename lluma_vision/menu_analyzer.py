@@ -1,13 +1,22 @@
 """Menu state analysis for Uma Musume screenshots."""
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import Any, List, Optional
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
+try:  # pragma: no cover - optional dependency
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore[assignment]
 from PIL import Image
 
 Logger = logging.Logger
@@ -28,12 +37,28 @@ class TabInfo:
     availability: TabAvailability
 
 
-@dataclass(slots=True) 
+@dataclass(slots=True)
 class MenuState:
     """Complete menu state analysis result."""
     is_usable: bool  # False if blurred/inactive
     selected_tab: Optional[str]
     tabs: List[TabInfo]
+
+    def available_tabs(self) -> List[str]:
+        """Return the names of tabs detected as available for interaction."""
+
+        return [tab.name for tab in self.tabs if tab.availability == TabAvailability.AVAILABLE]
+
+
+@dataclass(slots=True)
+class ScrollbarInfo:
+    """Describes a detected vertical scrollbar in the primary view."""
+
+    track_bounds: tuple[int, int, int, int]  # x, y, width, height
+    thumb_bounds: tuple[int, int, int, int]  # x, y, width, height
+    can_scroll_up: bool
+    can_scroll_down: bool
+    thumb_ratio: float  # 0.0 (top) → 1.0 (bottom)
 
 
 class MenuAnalyzer:
@@ -49,10 +74,23 @@ class MenuAnalyzer:
         "Item Request",
         "Menu"
     ]
-    
+    LEFT_TRIM_RATIO = 0.15  # proportion of image width trimmed from the left before VLM calls
+    PRIMARY_SCROLLBAR_BAND_WIDTH = 220  # width of primary-image band used for scrollbar detection
+    SCROLLBAR_MIN_WIDTH = 8
+    SCROLLBAR_MAX_WIDTH = 16
+    SCROLLBAR_SEARCH_WIDTH = 160  # search only within this many pixels of the right edge
+    SCROLLBAR_MIN_EDGE_STRENGTH = 5.0
+    SCROLLBAR_SMOOTH_KERNEL = 9
+    SCROLLBAR_THUMB_DELTA = 28.0
+    SCROLLBAR_MIN_THUMB_RATIO = 0.02
+    SCROLLBAR_MIN_THUMB_PIXELS = 20
+    SCROLLBAR_END_MARGIN_RATIO = 0.015
+    SCROLLBAR_END_MARGIN_MIN = 10
+
     def __init__(self, logger: Optional[Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
-    
+        self._openrouter_client: Any = None
+
     def analyze_menu(self, menu_image: Image.Image) -> MenuState:
         """Analyze a menu section image and return the menu state."""
         
@@ -248,3 +286,381 @@ class MenuAnalyzer:
             return TabAvailability.AVAILABLE
         else:
             return TabAvailability.UNAVAILABLE
+
+    def get_clickable_buttons(self, image_path: str) -> list[dict]:
+        """
+        Uses a VLM to get clickable buttons from an image.
+
+        Args:
+            image_path: The path to the image file.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a button
+            with 'box_2d' and 'label' keys.
+        """
+        image_file = Path(image_path)
+        if not image_file.exists():
+            raise FileNotFoundError(f"Image path does not exist: {image_file}")
+
+        client = self._get_openrouter_client()
+
+        base64_image = self._prepare_api_image(image_file, trim_left_ratio=self.LEFT_TRIM_RATIO)
+
+        system_prompt = (
+            "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) "
+            "to find interactive buttons. Respond with JSON listing each distinct clickable button once. "
+            "Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] "
+            "with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; "
+            "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags."
+        )
+
+        user_instructions = (
+            "Return a JSON object with a single property `buttons` that is an array of button records. "
+            "Every record must have `label` (string) and `box_2d` (array of four floats). "
+            "Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
+        )
+
+        payload = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_instructions},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ],
+        }
+
+        try:
+            response = client.chat.completions.create(
+                model="google/gemini-flash-2.5-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    payload,
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            self._logger.error("Error querying OpenRouter: %s", exc)
+            return []
+
+        content = self._extract_response_content(response)
+        if content is None:
+            return []
+
+        return self._parse_buttons_payload(content)
+
+    def get_primary_elements(self, image_path: str) -> list[dict]:
+        """Detect primary-region buttons via the VLM."""
+
+        image_file = Path(image_path)
+        if not image_file.exists():
+            raise FileNotFoundError(f"Image path does not exist: {image_file}")
+
+        client = self._get_openrouter_client()
+        base64_image = self._prepare_api_image(image_file, trim_left_ratio=0.0)
+
+        system_prompt = (
+            "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
+            "Return structured JSON so an agent can decide interactions. "
+            "List each distinct clickable button once with its label and bounds."
+        )
+
+        user_instructions = (
+            "Respond with a JSON object that includes a `buttons` array. "
+            "Each button entry must have `label` and `box_2d` fields. Avoid confidence/state/type suffixes unless they add useful hints like `|hint=New`. "
+            "If no buttons exist, use an empty array."
+        )
+
+        payload = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_instructions},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ],
+        }
+
+        try:
+            response = client.chat.completions.create(
+                model="google/gemini-flash-2.5-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    payload,
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            self._logger.error("Error querying OpenRouter: %s", exc)
+            return []
+
+        content = self._extract_response_content(response)
+        if content is None:
+            return []
+
+        return self._parse_buttons_payload(content)
+
+    def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
+        """Heuristically detect a vertical scrollbar within a primary capture."""
+
+        arr = np.asarray(primary_image, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            self._logger.debug("Primary image lacks expected RGB channels; skipping scrollbar detection")
+            return None
+
+        height, width, _ = arr.shape
+        if width < 2:
+            return None
+
+        band_width = min(self.PRIMARY_SCROLLBAR_BAND_WIDTH, width)
+        band = arr[:, width - band_width :, :]
+
+        # Compute luma channel for gradient/variance analysis
+        luma = 0.2126 * band[:, :, 0] + 0.7152 * band[:, :, 1] + 0.0722 * band[:, :, 2]
+        if luma.shape[1] < 2:
+            return None
+
+        gradients = np.abs(np.diff(luma, axis=1))
+        mean_grad = gradients.mean(axis=0)
+        grad_threshold = float(mean_grad.mean() + mean_grad.std())
+        edge_candidates = [idx for idx, value in enumerate(mean_grad) if value >= grad_threshold]
+
+        if not edge_candidates:
+            return None
+
+        best_candidate: Optional[tuple[float, int, int, float]] = None
+        for left_edge in edge_candidates:
+            for right_edge in edge_candidates:
+                if right_edge <= left_edge:
+                    continue
+
+                window_width = right_edge - left_edge
+                if not (self.SCROLLBAR_MIN_WIDTH <= window_width <= self.SCROLLBAR_MAX_WIDTH):
+                    continue
+
+                global_left = width - band_width + left_edge
+                if global_left < width - self.SCROLLBAR_SEARCH_WIDTH:
+                    continue
+
+                edge_strength = float(mean_grad[left_edge] + mean_grad[right_edge - 1])
+                if edge_strength < self.SCROLLBAR_MIN_EDGE_STRENGTH:
+                    continue
+
+                window = luma[:, left_edge:right_edge]
+                inside_std = float(np.std(window))
+                score = inside_std / (edge_strength + 1e-6)
+
+                if best_candidate is None or score < best_candidate[0]:
+                    best_candidate = (score, left_edge, right_edge, edge_strength)
+
+        if best_candidate is None:
+            return None
+
+        _, left_idx, right_idx, edge_strength = best_candidate
+        track_x0 = width - band_width + left_idx
+        track_x1 = width - band_width + right_idx
+
+        window = luma[:, left_idx:right_idx]
+        row_mean = window.mean(axis=1)
+
+        # Smooth to reduce row-level noise
+        kernel = np.ones(self.SCROLLBAR_SMOOTH_KERNEL, dtype=np.float32) / self.SCROLLBAR_SMOOTH_KERNEL
+        smooth = np.convolve(row_mean, kernel, mode="same")
+
+        bright_reference = float(np.percentile(smooth, 80))
+        thumb_threshold = bright_reference - self.SCROLLBAR_THUMB_DELTA
+
+        mask = smooth <= thumb_threshold
+        min_thumb_span = max(
+            self.SCROLLBAR_MIN_THUMB_PIXELS,
+            int(height * self.SCROLLBAR_MIN_THUMB_RATIO),
+        )
+
+        thumb_segment = self._largest_segment(mask, min_thumb_span)
+        if thumb_segment is None:
+            self._logger.debug("Detected scrollbar track but no thumb segment matched thresholds")
+            return None
+
+        thumb_top, thumb_bottom = thumb_segment
+        track_width = track_x1 - track_x0
+        thumb_height = thumb_bottom - thumb_top + 1
+
+        margin = max(self.SCROLLBAR_END_MARGIN_MIN, int(height * self.SCROLLBAR_END_MARGIN_RATIO))
+        can_scroll_up = thumb_top > margin
+        can_scroll_down = thumb_bottom < (height - margin)
+
+        thumb_center = (thumb_top + thumb_bottom) / 2.0
+        thumb_ratio = float(np.clip(thumb_center / max(height - 1, 1), 0.0, 1.0))
+
+        track_bounds = (int(track_x0), 0, int(track_width), int(height))
+        thumb_bounds = (int(track_x0), int(thumb_top), int(track_width), int(thumb_height))
+
+        return ScrollbarInfo(
+            track_bounds=track_bounds,
+            thumb_bounds=thumb_bounds,
+            can_scroll_up=can_scroll_up,
+            can_scroll_down=can_scroll_down,
+            thumb_ratio=thumb_ratio,
+        )
+
+    def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> str:
+        """Load, trim, and encode the image region sent to the VLM."""
+
+        with Image.open(image_file) as image:
+            trimmed = self._trim_left_region(image, trim_left_ratio)
+            with BytesIO() as buffer:
+                trimmed.save(buffer, format="PNG")
+                return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Image.Image:
+        """Remove a fixed-width strip before querying the VLM."""
+
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return image.copy()
+
+        trim_px = int(width * max(0.0, min(trim_left_ratio, 1.0)))
+        if trim_px >= width:
+            trim_px = max(0, width - 1)
+
+        cropped = image.crop((trim_px, 0, width, height))
+        return cropped.copy()
+
+    def _largest_segment(self, mask: np.ndarray, min_length: int) -> Optional[tuple[int, int]]:
+        """Return the longest contiguous True segment meeting the minimum length."""
+
+        best: Optional[tuple[int, int]] = None
+        start: Optional[int] = None
+
+        for idx, value in enumerate(mask):
+            if value and start is None:
+                start = idx
+            elif not value and start is not None:
+                end = idx - 1
+                if end - start + 1 >= min_length:
+                    if best is None or (end - start) > (best[1] - best[0]):
+                        best = (start, end)
+                start = None
+
+        if start is not None:
+            end = len(mask) - 1
+            if end - start + 1 >= min_length:
+                if best is None or (end - start) > (best[1] - best[0]):
+                    best = (start, end)
+
+        return best
+
+    def _get_openrouter_client(self) -> Any:
+        """Initialise a cached OpenRouter client."""
+
+        if self._openrouter_client is not None:
+            return self._openrouter_client
+
+        if OpenAI is None:
+            raise ImportError(
+                "openai package is required for OpenRouter integration. Install it via `pip install openai`."
+            )
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY environment variable not set.")
+
+        self._openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            default_headers={
+                "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+                "X-Title": "LLuMa Musume Agent",
+            },
+        )
+        return self._openrouter_client
+
+    def _extract_response_content(self, response: Any) -> Optional[str]:
+        """Safely pull the content string from an OpenRouter response object."""
+
+        try:
+            choices = getattr(response, "choices", None)
+            if not choices:
+                return None
+            message = choices[0].message
+            content = getattr(message, "content", None)
+            if not content:
+                return None
+            return str(content).strip()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._logger.error("Unexpected OpenRouter response schema: %s", exc)
+            return None
+
+    def _parse_buttons_payload(self, raw_json: str) -> list[dict]:
+        """Parse a JSON payload containing a buttons array."""
+
+        payload = self._load_json_document(raw_json)
+        if payload is None:
+            return []
+
+        buttons_field: Any
+        if isinstance(payload, dict):
+            buttons_field = payload.get("buttons")
+        else:
+            buttons_field = payload
+
+        return self._parse_buttons_array(buttons_field)
+
+    def _parse_buttons_array(self, buttons_field: Any) -> list[dict]:
+        """Normalize a list of button entries."""
+
+        if not isinstance(buttons_field, list):
+            self._logger.debug("OpenRouter payload missing buttons list")
+            return []
+
+        buttons: list[dict] = []
+        for idx, entry in enumerate(buttons_field):
+            if not isinstance(entry, dict):
+                self._logger.debug("Skipping non-dict button entry at index %d", idx)
+                continue
+
+            label = entry.get("label")
+            box = entry.get("box_2d")
+            if not label or not isinstance(label, str):
+                self._logger.debug("Skipping button without valid label at index %d", idx)
+                continue
+
+            if not isinstance(box, list) or len(box) != 4:
+                self._logger.debug("Skipping button with invalid box_2d at index %d", idx)
+                continue
+
+            valid_box = self._normalise_box_values(box)
+            buttons.append({"label": label, "box_2d": valid_box})
+
+        return buttons
+
+    def _load_json_document(self, raw_json: str) -> Optional[Any]:
+        """Strip common wrappers and parse JSON content."""
+
+        cleaned = raw_json.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: -3].strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            self._logger.error("Failed to decode OpenRouter JSON: %s", exc)
+            return None
+
+    def _normalise_box_values(self, box: list[Any]) -> list[float]:
+        """Convert box values to floats clamped to the expected 0-1000 range."""
+
+        cleaned: list[float] = []
+        for value in box:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = 0.0
+            cleaned.append(max(0.0, min(1000.0, numeric)))
+        return cleaned
+
+    # Scrollbar detection is handled outside of the VLM for now.
