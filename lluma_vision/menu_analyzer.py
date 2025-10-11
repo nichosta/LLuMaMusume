@@ -44,6 +44,11 @@ class MenuState:
     selected_tab: Optional[str]
     tabs: List[TabInfo]
 
+    def available_tabs(self) -> List[str]:
+        """Return the names of tabs detected as available for interaction."""
+
+        return [tab.name for tab in self.tabs if tab.availability == TabAvailability.AVAILABLE]
+
 
 @dataclass(slots=True)
 class ScrollbarInfo:

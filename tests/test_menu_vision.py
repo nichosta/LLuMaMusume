@@ -9,8 +9,8 @@ from pathlib import Path
 
 from PIL import Image
 
-from lluma_vision import MenuAnalyzer
-from lluma_vision.menu_analyzer import ScrollbarInfo, TabAvailability
+from lluma_vision import MenuAnalyzer, MenuState, TabAvailability
+from lluma_vision.menu_analyzer import ScrollbarInfo, TabInfo
 
 DATA_DIR = Path(__file__).parent / "data" / "menu_captures"
 MENU_SECTION_START_RATIO = 0.5  # menus occupy the right half of the capture
@@ -114,6 +114,19 @@ class MenuVisionRegressionTest(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual(parsed[0]["label"], "Enter")
         self.assertEqual(parsed[0]["box_2d"], [10.0, 20.0, 200.0, 220.0])
+
+    def test_menu_state_available_tabs_helper(self) -> None:
+        state = MenuState(
+            is_usable=True,
+            selected_tab="Menu",
+            tabs=[
+                TabInfo("Jukebox", False, TabAvailability.AVAILABLE),
+                TabInfo("Sparks", False, TabAvailability.UNAVAILABLE),
+                TabInfo("Menu", True, TabAvailability.AVAILABLE),
+            ],
+        )
+
+        self.assertListEqual(state.available_tabs(), ["Jukebox", "Menu"])
 
     def test_prepare_api_image_trims_left_region(self) -> None:
         analyzer = MenuAnalyzer()
