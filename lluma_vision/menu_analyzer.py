@@ -181,19 +181,21 @@ class MenuAnalyzer:
         img_array = np.asarray(image)
         height, width = img_array.shape[:2]
         
-        # For availability detection, use narrower area focused on tab buttons
-        # The actual tab buttons are in the leftmost portion 
-        tab_width = int(width * 0.25)  # Use 25% of menu width for availability detection
+        # For availability detection, focus on the button backing near the right edge.
+        # The active/inactive fill sits in the last ~15% of the menu pane (mirrors left_pin ratio overall).
+        tab_width = max(int(width * 0.15), 1)
+        tab_region_start = max(width - tab_width, 0)
+        tab_region_end = width
         tab_height = height // len(self.TAB_NAMES)
         availabilities = {}
-        
+
         for i, tab_name in enumerate(self.TAB_NAMES):
             # Define region for this tab (only the tab area, not full width)
             y_start = i * tab_height
             y_end = min((i + 1) * tab_height, height)
-            
-            # Extract only the tab region (leftmost portion)
-            tab_region = img_array[y_start:y_end, 0:tab_width, :]
+
+            # Extract only the tab region (right edge backing without the icons)
+            tab_region = img_array[y_start:y_end, tab_region_start:tab_region_end, :]
             
             # Calculate brightness/saturation to distinguish white vs gray
             availability = self._classify_tab_availability(tab_region)
@@ -229,10 +231,20 @@ class MenuAnalyzer:
         # Based on analysis of reference images:
         # Available tabs: rgb_balance > 0.040 OR brightness > 230
         # Unavailable tabs: rgb_balance <= 0.040 AND brightness <= 230
-        balance_threshold = 0.040
+        balance_threshold = 0.075
         brightness_threshold = 230.0
         
         if rgb_balance > balance_threshold or brightness > brightness_threshold:
+            if brightness > brightness_threshold:
+                # Flat/no-edge regions with very high brightness correspond to greyed-out tabs
+                region_gray = np.dot(region[..., :3], [0.299, 0.587, 0.114])
+                gy, gx = np.gradient(region_gray)
+                edge_strength = float(np.mean(np.sqrt(gx * gx + gy * gy)))
+                edge_threshold = 0.3
+
+                if edge_strength < edge_threshold:
+                    return TabAvailability.UNAVAILABLE
+
             return TabAvailability.AVAILABLE
         else:
             return TabAvailability.UNAVAILABLE
