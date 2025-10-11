@@ -150,17 +150,19 @@ class CaptureManager:
             return None, None
 
         width, height = image.size
-        scale = max(client_area.scaling_factor, 1e-6)
-        left_pin_logical = max(split_cfg.left_pin_px, 0)
-        left_pin = int(round(left_pin_logical * scale))
-        available_width = max(width - left_pin, 0)
-        ratio_sum = max(split_cfg.primary_ratio + split_cfg.menus_ratio, 1e-6)
-        primary_ratio = split_cfg.primary_ratio / ratio_sum
-        primary_width = int(round(available_width * primary_ratio))
-        primary_width = max(primary_width, 0)
-        primary_end = min(left_pin + primary_width, width)
-        primary_box = (left_pin, 0, primary_end, height)
-        menus_box = (primary_box[2], 0, width, height)
+        
+        # Calculate section boundaries using simple ratios
+        left_pin_end = int(round(width * split_cfg.left_pin_ratio))
+        primary_end = int(round(width * (split_cfg.left_pin_ratio + split_cfg.primary_ratio)))
+        # menus goes to end of image (width * 1.0)
+        
+        # Ensure boundaries are valid
+        left_pin_end = max(0, min(left_pin_end, width))
+        primary_end = max(left_pin_end, min(primary_end, width))
+        
+        # Crop the sections (discard left pin, keep primary and menus)
+        primary_box = (left_pin_end, 0, primary_end, height)
+        menus_box = (primary_end, 0, width, height)
 
         primary_image = image.crop(primary_box) if primary_box[2] > primary_box[0] else None
         menus_image = image.crop(menus_box) if menus_box[2] > menus_box[0] else None

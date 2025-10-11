@@ -28,10 +28,9 @@ capture:
   output_dir: temp_captures
   split:
     enabled: false
-    left_pin_px: 12
-    ratios:
-      primary: 0.6
-      menus: 0.4
+    left_pin_ratio: 0.1
+    primary_ratio: 0.6
+    menus_ratio: 0.3
   validation:
     min_mean_luminance: 15
     min_luminance_stddev: 2
@@ -49,8 +48,9 @@ capture:
         self.assertEqual(window_cfg.scaling_factor, 2.0)
         self.assertEqual(capture_cfg.output_dir, Path("temp_captures"))
         self.assertFalse(capture_cfg.split.enabled)
-        self.assertEqual(capture_cfg.split.left_pin_px, 12)
+        self.assertAlmostEqual(capture_cfg.split.left_pin_ratio, 0.1)
         self.assertAlmostEqual(capture_cfg.split.primary_ratio, 0.6)
+        self.assertAlmostEqual(capture_cfg.split.menus_ratio, 0.3)
         self.assertEqual(capture_cfg.retention.max_captures, 20)
         self.assertEqual(capture_cfg.scaling_factor, window_cfg.scaling_factor)
 

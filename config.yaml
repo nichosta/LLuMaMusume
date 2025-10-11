@@ -2,7 +2,6 @@ window:
   client_offset: [6, 30]
 capture:
   split:
-    left_pin_px: 133
-    ratios:
-      primary: 0.42126
-      menus: 0.5
+    left_pin_ratio: 0.07874    # Left pin area (discarded)
+    primary_ratio: 0.42126     # Primary gameplay area
+    menus_ratio: 0.50          # Menu/UI area

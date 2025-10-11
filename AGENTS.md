@@ -47,7 +47,7 @@ Capture specifics
 - Region: Compute client-area rect (logical px), transform to screen px using the `scaling_factor` (150%), and pass to MSS as the crop box.
 - Validation: Verify capture size matches expected client-area size; sample a small pixel grid to ensure the image is non-black/non-uniform. If invalid, retry once after refocusing; otherwise skip the turn with a diagnostic.
 - Format: Save raw PNG (lossless) for Vision. Optionally save a JPEG preview for logs.
-- Splitting: Produce `Primary` and `Menus` crops from the raw capture. Initial split heuristic is configuration-driven (TBD; measure in-game UI). Keep split ratios in config and recompute from the client width each run.
+- Splitting: Produce `Primary` and `Menus` crops from the raw capture. Split uses three ratios that sum to 1.0: `left_pin_ratio` (discarded left strip), `primary_ratio` (gameplay area), and `menus_ratio` (UI area). All ratios are percentages of total client width.
 - Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png` and `captures/<turn_id>-menus.png` when split is enabled.
 - Retention: Keep the last N turns (configurable, e.g., 200) and clean older files on startup.
 - Occlusion: We rely on focus + top-level z-order; per-window capture is not used. If occluded content is suspected (e.g., unexpected uniform regions), abort the turn.
@@ -62,7 +62,7 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
 
 - Inputs
   - Images: full client-area PNG plus derived crops `Primary` and `Menus`.
-  - Optional masking: exclude the left-side pin strip region from detection (measurement required; keep as config `left_pin_px` or `%`).
+  - Optional masking: exclude the left-side pin strip region from detection (configured via `split.left_pin_ratio`).
   - Normalization: apply light denoise and brightness/contrast normalization to stabilize detection; do not alter geometry.
 
 - Gemini detection mode
@@ -79,12 +79,12 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
   - `buttons`: list of { `name`, `bounds` (client logical px: x,y,w,h), `state`, `section`, `type` }
   - `hotspots`: named regions like `dialogue_center`, `confirm_ok`, etc., same bounds convention
   - `overlays`: detected UI states such as `tutorial_overlay`, `modal_dialog`, `loading_mask`
-  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_px` }
+  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_ratio` }
 
 - Coordinate conversion
   - Gemini provides normalized coords per input image (full or crop). Convert to crop pixels, then to client logical px.
   - Steps: `crop_px = norm/1000 * crop_size_px` → `screen_px = crop_px + crop_origin_screen` → `client_logical_px = round(screen_px / scaling_factor)`.
-  - If a left pin strip is cropped/masked, add its width to the X-origin before back-projection.
+  - If a left pin strip is cropped (based on `left_pin_ratio`), add its width to the X-origin before back-projection.
 
 - Inactive/disabled UI handling
   - Heuristics: look for blur, darkening, greyed text, lock icons, and unlock-condition text; encode as `state=inactive|locked` with a brief `hint` where possible.
@@ -202,9 +202,9 @@ Centralized configuration defines environment- and game-specific parameters. Use
 - Capture & Vision
   - `capture.post_action`: false (optional extra capture after inputs)
   - `capture.retention`: 200 (number of turns to keep)
-  - `split.primary_menus`: true
-  - `split.left_pin_px`: TBD (logical px; measured) — use 0 until measured
-  - `split.ratios`: TBD (derive from measurement; expressed as percent of client width/height)
+  - `split.left_pin_ratio`: 0.07874 (proportion of width for left pin strip, discarded)
+  - `split.primary_ratio`: 0.42126 (proportion of width for primary gameplay area)
+  - `split.menus_ratio`: 0.50 (proportion of width for menus/UI area)
   - `vision.parallel_calls`: true (allow per-crop prompts concurrently)
 
 - Input behavior
@@ -260,4 +260,4 @@ Install Python 3.14.0 (x64), then install dependencies via `pip install -r requi
 Environment
 - Set `GEMINI_API_KEY` in the environment for Vision calls.
 - Ensure Steam window title is exactly `Umamusume`.
-- First-run checklist: verify window placement (0,0 @ 1920×1080), confirm capture works, measure and set `split.left_pin_px`.
+- First-run checklist: verify window placement (0,0 @ 1920×1080), confirm capture works, adjust split ratios as needed.

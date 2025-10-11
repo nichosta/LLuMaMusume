@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/test_capture_split.py -v)",
+      "Bash(python3 -m pytest tests/test_capture_split.py -v)",
+      "Bash(source:*)",
+      "Bash(PYTHONPATH=/mnt/c/repositories/LLuMaMusume python3 tests/test_capture_split.py)",
+      "Bash(PYTHONPATH=/mnt/c/repositories/LLuMaMusume python3 tests/test_config_loader.py)",
+      "Bash(PYTHONPATH=/mnt/c/repositories/LLuMaMusume python3 -m unittest discover tests/ -v)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
