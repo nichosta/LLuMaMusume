@@ -18,9 +18,9 @@ class CaptureSplitTest(unittest.TestCase):
     def test_split_respects_ratios(self) -> None:
         config = CaptureConfig()
         config.split.enabled = True
-        config.split.left_pin_px = 10
-        config.split.primary_ratio = 0.5
-        config.split.menus_ratio = 0.5
+        config.split.left_pin_ratio = 0.09    # 10px of 110px
+        config.split.primary_ratio = 0.455    # 50px of 110px  
+        config.split.menus_ratio = 0.455      # 50px of 110px (sum = 1.0)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config.output_dir = Path(tmpdir)
@@ -37,6 +37,9 @@ class CaptureSplitTest(unittest.TestCase):
 
         self.assertIsNotNone(primary)
         self.assertIsNotNone(menus)
+        # left_pin: 0-10px (discarded)
+        # primary: 10-60px (width=50)  
+        # menus: 60-110px (width=50)
         self.assertEqual(primary.size, (50, 20))
         self.assertEqual(menus.size, (50, 20))
 

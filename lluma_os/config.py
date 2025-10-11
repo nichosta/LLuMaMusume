@@ -41,9 +41,15 @@ class SplitConfig:
     """Controls optional primary/menus image splitting."""
 
     enabled: bool = True
-    left_pin_px: int = 0
-    primary_ratio: float = 0.5  # proportion of width assigned to primary view
-    menus_ratio: float = 0.5  # fallback; recomputed from width at runtime
+    left_pin_ratio: float = 0.1  # proportion of width for left pin (discarded)
+    primary_ratio: float = 0.4  # proportion of width assigned to primary view
+    menus_ratio: float = 0.5    # proportion of width assigned to menus view
+    
+    def __post_init__(self) -> None:
+        """Validate that ratios sum to 1.0."""
+        total = self.left_pin_ratio + self.primary_ratio + self.menus_ratio
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"Split ratios must sum to 1.0, got {total:.6f}")
 
 
 @dataclass(slots=True)
@@ -144,12 +150,23 @@ def _apply_capture_config(config: CaptureConfig, data: Dict) -> None:
     split_data = data.get("split") or {}
     if split_data:
         config.split.enabled = bool(split_data.get("enabled", config.split.enabled))
-        if "left_pin_px" in split_data:
-            config.split.left_pin_px = int(split_data["left_pin_px"])
+        
+        # Handle new three-ratio structure
+        if "left_pin_ratio" in split_data:
+            config.split.left_pin_ratio = float(split_data["left_pin_ratio"])
+        if "primary_ratio" in split_data:
+            config.split.primary_ratio = float(split_data["primary_ratio"])
+        if "menus_ratio" in split_data:
+            config.split.menus_ratio = float(split_data["menus_ratio"])
+            
+        # Legacy support for old ratios structure
         ratios = split_data.get("ratios")
         if isinstance(ratios, dict):
+            left_pin = ratios.get("left_pin")
             primary = ratios.get("primary")
             menus = ratios.get("menus")
+            if left_pin is not None:
+                config.split.left_pin_ratio = float(left_pin)
             if primary is not None:
                 config.split.primary_ratio = float(primary)
             if menus is not None:
