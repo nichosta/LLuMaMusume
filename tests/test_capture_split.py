@@ -37,7 +37,7 @@ class CaptureSplitTest(unittest.TestCase):
 
         self.assertIsNotNone(primary)
         self.assertIsNotNone(menus)
-        self.assertEqual(primary.size, (60, 20))
+        self.assertEqual(primary.size, (50, 20))
         self.assertEqual(menus.size, (50, 20))
 
 
