@@ -1,13 +1,22 @@
 """Menu state analysis for Uma Musume screenshots."""
 from __future__ import annotations
 
+import base64
+import json
 import logging
+import os
 from dataclasses import dataclass
 from enum import Enum
-from typing import List, Optional
+from io import BytesIO
+from pathlib import Path
+from typing import Any, List, Optional
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
+try:  # pragma: no cover - optional dependency
+    from openai import OpenAI
+except ImportError:  # pragma: no cover - optional dependency
+    OpenAI = None  # type: ignore[assignment]
 from PIL import Image
 
 Logger = logging.Logger
@@ -49,10 +58,12 @@ class MenuAnalyzer:
         "Item Request",
         "Menu"
     ]
-    
+    LEFT_TRIM_RATIO = 0.15  # proportion of image width trimmed from the left before VLM calls
+
     def __init__(self, logger: Optional[Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
-    
+        self._openrouter_client: Any = None
+
     def analyze_menu(self, menu_image: Image.Image) -> MenuState:
         """Analyze a menu section image and return the menu state."""
         
@@ -248,3 +259,254 @@ class MenuAnalyzer:
             return TabAvailability.AVAILABLE
         else:
             return TabAvailability.UNAVAILABLE
+
+    def get_clickable_buttons(self, image_path: str) -> list[dict]:
+        """
+        Uses a VLM to get clickable buttons from an image.
+
+        Args:
+            image_path: The path to the image file.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a button
+            with 'box_2d' and 'label' keys.
+        """
+        image_file = Path(image_path)
+        if not image_file.exists():
+            raise FileNotFoundError(f"Image path does not exist: {image_file}")
+
+        client = self._get_openrouter_client()
+
+        base64_image = self._prepare_api_image(image_file, trim_left_ratio=self.LEFT_TRIM_RATIO)
+
+        system_prompt = (
+            "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) "
+            "to find interactive buttons. Respond with JSON listing each distinct clickable button once. "
+            "Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] "
+            "with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; "
+            "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags."
+        )
+
+        user_instructions = (
+            "Return a JSON object with a single property `buttons` that is an array of button records. "
+            "Every record must have `label` (string) and `box_2d` (array of four floats). "
+            "Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
+        )
+
+        payload = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_instructions},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ],
+        }
+
+        try:
+            response = client.chat.completions.create(
+                model="google/gemini-flash-2.5-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    payload,
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            self._logger.error("Error querying OpenRouter: %s", exc)
+            return []
+
+        content = self._extract_response_content(response)
+        if content is None:
+            return []
+
+        return self._parse_buttons_payload(content)
+
+    def get_primary_elements(self, image_path: str) -> list[dict]:
+        """Detect primary-region buttons via the VLM."""
+
+        image_file = Path(image_path)
+        if not image_file.exists():
+            raise FileNotFoundError(f"Image path does not exist: {image_file}")
+
+        client = self._get_openrouter_client()
+        base64_image = self._prepare_api_image(image_file, trim_left_ratio=0.0)
+
+        system_prompt = (
+            "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
+            "Return structured JSON so an agent can decide interactions. "
+            "List each distinct clickable button once with its label and bounds."
+        )
+
+        user_instructions = (
+            "Respond with a JSON object that includes a `buttons` array. "
+            "Each button entry must have `label` and `box_2d` fields. Avoid confidence/state/type suffixes unless they add useful hints like `|hint=New`. "
+            "If no buttons exist, use an empty array."
+        )
+
+        payload = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_instructions},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ],
+        }
+
+        try:
+            response = client.chat.completions.create(
+                model="google/gemini-flash-2.5-latest",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    payload,
+                ],
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # pragma: no cover - network failure path
+            self._logger.error("Error querying OpenRouter: %s", exc)
+            return []
+
+        content = self._extract_response_content(response)
+        if content is None:
+            return []
+
+        return self._parse_buttons_payload(content)
+
+    def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> str:
+        """Load, trim, and encode the image region sent to the VLM."""
+
+        with Image.open(image_file) as image:
+            trimmed = self._trim_left_region(image, trim_left_ratio)
+            with BytesIO() as buffer:
+                trimmed.save(buffer, format="PNG")
+                return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+    def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Image.Image:
+        """Remove a fixed-width strip before querying the VLM."""
+
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return image.copy()
+
+        trim_px = int(width * max(0.0, min(trim_left_ratio, 1.0)))
+        if trim_px >= width:
+            trim_px = max(0, width - 1)
+
+        cropped = image.crop((trim_px, 0, width, height))
+        return cropped.copy()
+
+    def _get_openrouter_client(self) -> Any:
+        """Initialise a cached OpenRouter client."""
+
+        if self._openrouter_client is not None:
+            return self._openrouter_client
+
+        if OpenAI is None:
+            raise ImportError(
+                "openai package is required for OpenRouter integration. Install it via `pip install openai`."
+            )
+
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            raise ValueError("OPENROUTER_API_KEY environment variable not set.")
+
+        self._openrouter_client = OpenAI(
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+            default_headers={
+                "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+                "X-Title": "LLuMa Musume Agent",
+            },
+        )
+        return self._openrouter_client
+
+    def _extract_response_content(self, response: Any) -> Optional[str]:
+        """Safely pull the content string from an OpenRouter response object."""
+
+        try:
+            choices = getattr(response, "choices", None)
+            if not choices:
+                return None
+            message = choices[0].message
+            content = getattr(message, "content", None)
+            if not content:
+                return None
+            return str(content).strip()
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._logger.error("Unexpected OpenRouter response schema: %s", exc)
+            return None
+
+    def _parse_buttons_payload(self, raw_json: str) -> list[dict]:
+        """Parse a JSON payload containing a buttons array."""
+
+        payload = self._load_json_document(raw_json)
+        if payload is None:
+            return []
+
+        buttons_field: Any
+        if isinstance(payload, dict):
+            buttons_field = payload.get("buttons")
+        else:
+            buttons_field = payload
+
+        return self._parse_buttons_array(buttons_field)
+
+    def _parse_buttons_array(self, buttons_field: Any) -> list[dict]:
+        """Normalize a list of button entries."""
+
+        if not isinstance(buttons_field, list):
+            self._logger.debug("OpenRouter payload missing buttons list")
+            return []
+
+        buttons: list[dict] = []
+        for idx, entry in enumerate(buttons_field):
+            if not isinstance(entry, dict):
+                self._logger.debug("Skipping non-dict button entry at index %d", idx)
+                continue
+
+            label = entry.get("label")
+            box = entry.get("box_2d")
+            if not label or not isinstance(label, str):
+                self._logger.debug("Skipping button without valid label at index %d", idx)
+                continue
+
+            if not isinstance(box, list) or len(box) != 4:
+                self._logger.debug("Skipping button with invalid box_2d at index %d", idx)
+                continue
+
+            valid_box = self._normalise_box_values(box)
+            buttons.append({"label": label, "box_2d": valid_box})
+
+        return buttons
+
+    def _load_json_document(self, raw_json: str) -> Optional[Any]:
+        """Strip common wrappers and parse JSON content."""
+
+        cleaned = raw_json.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        if cleaned.endswith("```"):
+            cleaned = cleaned[: -3].strip()
+
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            self._logger.error("Failed to decode OpenRouter JSON: %s", exc)
+            return None
+
+    def _normalise_box_values(self, box: list[Any]) -> list[float]:
+        """Convert box values to floats clamped to the expected 0-1000 range."""
+
+        cleaned: list[float] = []
+        for value in box:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                numeric = 0.0
+            cleaned.append(max(0.0, min(1000.0, numeric)))
+        return cleaned
+
+    # Scrollbar detection is handled outside of the VLM for now.
