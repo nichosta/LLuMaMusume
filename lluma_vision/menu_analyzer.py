@@ -7,6 +7,7 @@ from enum import Enum
 from typing import List, Optional
 
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image
 
 Logger = logging.Logger
@@ -88,30 +89,25 @@ class MenuAnalyzer:
     def _detect_usability(self, image: Image.Image) -> bool:
         """Detect if the menu is usable (not blurred/inactive)."""
         
-        # Convert to numpy array for analysis
-        img_array = np.asarray(image)
-        
+        # Convert to grayscale numpy array for analysis
+        gray = np.asarray(image.convert("L"), dtype=np.float32)
+
+        # Small images cannot provide a meaningful sharpness signal
+        if gray.shape[0] < 3 or gray.shape[1] < 3:
+            self._logger.debug("Menu image too small for sharpness detection; marking unusable")
+            return False
+
         # Calculate image sharpness using Laplacian variance
         # Blurred images have low variance in the Laplacian
-        gray = np.mean(img_array, axis=2) if len(img_array.shape) == 3 else img_array
-        
-        # Simple Laplacian kernel
-        laplacian = np.array([[0, -1, 0], [-1, 4, -1], [0, -1, 0]])
-        
-        # Convolve with Laplacian (simplified edge detection)
-        height, width = gray.shape
-        variance_sum = 0
-        count = 0
-        
-        for y in range(1, height - 1):
-            for x in range(1, width - 1):
-                # Apply Laplacian kernel
-                region = gray[y-1:y+2, x-1:x+2]
-                response = np.sum(region * laplacian)
-                variance_sum += response * response
-                count += 1
-        
-        sharpness = variance_sum / count if count > 0 else 0
+        laplacian_kernel = np.array(
+            [[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]],
+            dtype=np.float32,
+        )
+
+        # Vectorized convolution using sliding window view for better performance
+        windows = sliding_window_view(gray, (3, 3))
+        laplacian_response = np.einsum("ijkl,kl->ij", windows, laplacian_kernel)
+        sharpness = float(np.mean(laplacian_response * laplacian_response))
         
         # Threshold for determining if image is blurred
         # This threshold may need tuning based on actual data
