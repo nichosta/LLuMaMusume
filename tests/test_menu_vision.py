@@ -32,18 +32,21 @@ class MenuVisionRegressionTest(unittest.TestCase):
 
     def test_reference_captures(self) -> None:
         test_cases = [
+            # Tab is career profile, top 4 tabs are enabled, bottom 4 tabs are disabled
             {
                 "file": "career profile, bottom 3 disabled.png",
                 "expected_usable": True,
                 "expected_selected": "Career Profile",
                 "expected_available": ["Jukebox", "Sparks", "Log", "Career Profile"],
             },
+            # Tab is menu, all buttons in tab window are active, only topmost and bottommost tabs are selectable
             {
                 "file": "menu, all active.png",
                 "expected_usable": True,
                 "expected_selected": "Menu",
                 "expected_available": ["Jukebox", "Menu"],
             },
+            # Tab is menu, but the entire image is blurred, indicating unusability
             {
                 "file": "menu, all blurred.png",
                 "expected_usable": False,
