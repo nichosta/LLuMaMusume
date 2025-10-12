@@ -8,12 +8,13 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 
 - OS: Windows 11 24H2 (64-bit)
 - Python: 3.13.8 (x64), uv for package management.
-- Display: 2560×1600 (single monitor recommended; display scaling TBD — recommend 100%)
+- Display: 2560×1600 (16:10 aspect ratio, single monitor recommended; display scaling 150%)
 - Game: Uma Musume Pretty Derby (Steam)
-- Game mode: Windowed (in-game resolution TBD; document after testing)
+- Game mode: Windowed, positioned at (0,0) with outer size 1920×1080 (approximately 16:9)
+- Client area: 2538×1383 pixels (measured in practice)
 - Locale: English (NA)
 - GPU: No dedicated GPU required
-- Admin: TBD (document if required for reliable focus/input)
+- Admin: Not required
 
 # Window & Coordinates
 
@@ -51,7 +52,7 @@ Capture specifics
 - Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png` and `captures/<turn_id>-menus.png` when split is enabled.
 - Retention: Keep the last N turns (configurable, e.g., 200) and clean older files on startup.
 - Occlusion: We rely on focus + top-level z-order; per-window capture is not used. If occluded content is suspected (e.g., unexpected uniform regions), abort the turn.
-- Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is derived from local heuristics that examine the rightmost ~220 px band for the mauve/grey track and thumb.
+- Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is derived from local heuristics that examine the rightmost ~220 px band for the mauve/grey track and thumb (see `lluma_vision/menu_analyzer.py::detect_primary_scrollbar()` for implementation details).
 
 Menu content nuances
 - Sparks, Log, and Career Profile tabs rarely expose dedicated buttons; when these are the selected tab, pass the raw menu crop to the agent instead of the (likely empty) button list so it can rely on direct OCR.
@@ -87,8 +88,12 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
 
 - Coordinate conversion
   - The VLM provides normalized coords per input image (full or crop). Convert to crop pixels, then to client logical px.
-  - Steps: `crop_px = norm/1000 * crop_size_px` → `screen_px = crop_px + crop_origin_screen` → `client_logical_px = round(screen_px / scaling_factor)`.
+  - Steps:
+    1. `crop_px = (norm / 1000) * crop_size_px` (convert normalized 0-1000 to crop pixels)
+    2. `screen_px = crop_px + crop_origin_screen` (add crop origin in screen coordinates)
+    3. `client_logical_px = (screen_px - client_origin_on_screen) / scaling_factor` (convert to client-relative logical pixels)
   - If a left pin strip is cropped (based on `left_pin_ratio`), add its width to the X-origin before back-projection.
+  - Note: `crop_origin_screen` is the absolute screen position of the crop's top-left; `client_origin_on_screen` is the absolute screen position of the client area's top-left.
 
 - Inactive/disabled UI handling
   - Heuristics: look for blur, darkening, greyed text, lock icons, and unlock-condition text; encode as `state=inactive|locked` with a brief `hint` where possible.
@@ -112,6 +117,24 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
   - Optional: If config `allow_skip_cinematics=true`, click `Skip` once when detected; then proceed to results.
   - Reporting: Extract outcome from the first post-cinematic screen (e.g., race result placement/time, gacha pull list) via Vision labels and/or OCR from the raw capture.
 
+### VLM Prompts
+
+The Vision pipeline uses Google Gemini 2.5 Flash (as of October 2025, the latest in the Gemini series) via OpenRouter. Two prompts are used for button detection:
+
+**Menu Region Detection** (used by `get_clickable_buttons()`):
+- System: "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) to find interactive buttons. Respond with JSON listing each distinct clickable button once. Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags."
+- User: "Return a JSON object with a single property `buttons` that is an array of button records. Every record must have `label` (string) and `box_2d` (array of four floats). Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
+
+**Primary Region Detection** (used by `get_primary_elements()`):
+- System: "You analyse Uma Musume primary gameplay captures to find clickable UI elements. Return structured JSON so an agent can decide interactions. List each distinct clickable button once with its label and bounds."
+- User: "Respond with a JSON object that includes a `buttons` array. Each button entry must have `label` and `box_2d` fields. Avoid confidence/state/type suffixes unless they add useful hints like `|hint=New`. If no buttons exist, use an empty array."
+
+Notes:
+- Both prompts request JSON mode (`response_format: {type: "json_object"}`)
+- The left 15% of menu images is trimmed before VLM processing to remove fixed tab icons
+- Primary images are sent untrimmed
+- Implementation: `lluma_vision/menu_analyzer.py`
+
 ### Image Processing Stack
 
 Principle: Rely primarily on the VLM; keep preprocessing minimal, photometric-only, and geometry-preserving. Use simple masks and metrics; move heavier processing out unless proven necessary.
@@ -134,7 +157,7 @@ Principle: Rely primarily on the VLM; keep preprocessing minimal, photometric-on
 
 # Agent
 
-The LLM itself and its tools and abilities
+The LLM itself and its tools and abilities. The agent uses Google Gemini 2.5 Flash (as of October 2025, the latest in the Gemini series) via OpenRouter.
 
 ## Tools
 
@@ -142,7 +165,7 @@ Defines the abstract tools used by the model to interact with the game. Coordina
 
 ### Input API
 
-- `pressButton(name)`: Clicks the interactable whose bounding box is labeled `name` by Vision. Requires that the button is visible, enabled, and within the client area.
+- `pressButton(name)`: Clicks the center of the interactable whose bounding box is labeled `name` by Vision. Requires that the button is visible, enabled, and within the client area.
 - `advanceDialogue()`: Single click at the dialogue-advance hotspot (center region). Use for VN-style text advance and simple confirms.
 - `back()`: Sends in-game Back via `ESC`.
 - `confirm()`: Sends in-game Confirm via `SPACE`.
@@ -152,14 +175,16 @@ Defines the abstract tools used by the model to interact with the game. Coordina
 Notes
 - No raw coordinate tool (e.g., move/click) is exposed to the model. The harness may use internal coordinate helpers for window placement and diagnostics only.
 - Scrollbars and list widgets may be inconsistent; prefer button navigation when available. Treat `scrollUp/scrollDown` as best-effort and avoid repeated spamming.
+- `pressButton` clicks the geometric center of the detected bounding box for maximum reliability.
 
 ### Input Behavior & Safety
 
 - Focus guard: Before any input, ensure the "Umamusume" window is visible and focused. If not, skip the action and surface an error to the agent.
+- Window closure: If the game window is closed for any reason, the OS handler immediately stops the program.
 - Debounce: Coalesce duplicate tool calls within 300 ms (configurable). Do not double-click unless explicitly required by the button definition.
 - Timing: Apply small randomized jitter to press/release and inter-action delays to avoid mechanical timing (configurable).
 - Rate limits: Cap actions per turn and per minute to avoid runaway loops. Exceeding limits aborts remaining inputs for the turn.
-- Emergency stop: A global hotkey (e.g., `F12`) disables all inputs until re-enabled; status is logged and reported to the agent.
+- Emergency stop: Use Ctrl-C in the terminal running the main script.
 
 ### Failsafe Policy
 
@@ -167,10 +192,16 @@ Notes
   - Attempt a single `advanceDialogue()` as a gentle nudge.
   - If still no change, end the turn with a clear diagnostic (no blind clicks).
 - If a requested `pressButton(name)` is not visible/enabled, do not retry blindly. Report the missing/disabled state to the agent.
+- Loop detection: If the agent detects it is stuck in a loop (same screen state for multiple turns), it should use `advanceDialogue()` or `back()` as failsafes to break the loop.
 
 ## Memory
 
 The model has access to its own scratchpad; it is required to maintain most information about the game itself, including stats, inventory, and actual gameplay rules. The scratchpad is injected into the end of context right before the information for the current turn. The scratchpad is segmented into individual files to simplify the process of modification; the LLM is allowed to individually modify, create, and delete files itself, up to a cumulative 32k token allocation for the entire scratchpad. This is accomplished via the createMemoryFile(name), deleteMemoryFile(name), and writeMemoryFile(name, content) tool calls.
+
+Memory file naming:
+- All files reside in a single flat directory (no subdirectories or path separators)
+- No naming restrictions beyond filesystem limitations
+- Suggested convention: `player.yaml`, `run.yaml`, `ui_knowledge.md`, `todo.md`, etc.
 
 ## Turns
 
@@ -187,8 +218,9 @@ Context and summarization
 
 Memory scratchpad
 - The agent manages its scratchpad via `createMemoryFile(name)`, `deleteMemoryFile(name)`, `writeMemoryFile(name, content)`.
-- Cumulative scratchpad budget: 32k tokens across all files. Prefer compact structured text (e.g., YAML/JSON-lite) over verbose prose.
-- Recommended files: `state/player.yaml`, `state/run.yaml`, `knowledge/ui.md`, `todo.md`. Delete or truncate obsolete files proactively.
+- Cumulative scratchpad budget: also 32k tokens across all files. Prefer compact structured text (e.g., YAML/JSON-lite) over verbose prose.
+- Recommended files: `player.yaml`, `run.yaml`, `ui_knowledge.md`, `todo.md`. Delete or truncate obsolete files proactively.
+- Note: The turn context budget and the memory scratchpad budget are both 32k tokens, but they are separate allocations (turn history vs. persistent memory).
 
 Safety and limits
 - Max actions per turn: 10 (default). Max actions per minute: 60 (default). Exceeding limits aborts remaining inputs.
@@ -216,7 +248,6 @@ Centralized configuration defines environment- and game-specific parameters. Use
   - `input.jitter_ms`: { min: 20, max: 50 }
   - `input.max_actions_per_turn`: 10
   - `input.max_actions_per_minute`: 60
-  - `input.emergency_stop_key`: "F12"
   - `input.allow_skip_cinematics`: false
 
 - Turns & timeouts
@@ -225,6 +256,24 @@ Centralized configuration defines environment- and game-specific parameters. Use
   - `context.summarize_over_tokens`: 32000
 
 Recommended location: `config.yaml` at repo root. Environment overrides allowed via `LLUMA_*` env vars (optional).
+
+# Initial State & Stopping
+
+## Initial Game State
+The agent should be state-agnostic and capable of orienting itself regardless of the initial game state. It should assess the current screen and available actions on its first turn and proceed accordingly.
+
+## Stop Conditions
+The agent runs indefinitely until manual intervention (Ctrl-C in the terminal). No automatic stop conditions are implemented. For production runs, the game account should be reset to a fresh state; for testing, a mostly fresh account is acceptable.
+
+## Testing & Debugging
+- No mock/replay testing infrastructure is currently available; all testing is performed against the live game.
+- Debug logging can be configured via verbosity levels (error, warn, info, debug, trace).
+- Captures are retained (last 200 turns by default) for post-mortem analysis.
+
+## Error Recovery
+- **Window closure**: If the game window is closed, the program immediately stops.
+- **Checkpoint/resume**: Not currently implemented (TODO).
+- **Loop detection**: The agent should detect repeated screen states and use `advanceDialogue()` or `back()` to break loops.
 
 # Logging
 
@@ -252,16 +301,22 @@ Install Python 3.13.8 (x64), then install dependencies via `pip install -r requi
 - Confirmed runtime deps
   - OS I/O: `pyautogui`, `pygetwindow`, `mss`
   - Imaging: `pillow`, `numpy`
-  - Agent/VLM: `openrouter`
+  - Agent/VLM: `openai` (for OpenRouter client)
   - Config: `pyyaml`
 
 - Provisional deps (enable if/when needed)
-  - Hotkeys: `keyboard` or `pynput` (for global emergency stop)
   - JSON performance: `orjson`
   - Retry utilities: `tenacity`
   - Image processing extras: `opencv-python-headless`, `scikit-image`, `ImageHash`, `pytesseract`
 
 Environment
-- Set `OPENROUTER_API_KEY` in the environment for Vision calls.
+- Set `OPENROUTER_API_KEY` in the environment for Vision and Agent calls.
 - Ensure Steam window title is exactly `Umamusume`.
 - First-run checklist: verify window placement (0,0 @ 1920×1080), confirm capture works, adjust split ratios as needed.
+
+# TODO / Future Work
+
+- **Runtime DPI measurement**: Currently hardcoded at 1.5 (150% scaling); consider measuring at runtime for robustness across different display configurations.
+- **Checkpoint/resume**: Implement save/restore capability to resume agent sessions after interruption.
+- **Mock/replay testing**: Build infrastructure to test against recorded captures without running the live game.
+- **VLM prompt refinement**: The current prompts may need iteration based on actual detection performance; monitor false positives/negatives and adjust accordingly.
