@@ -33,7 +33,7 @@ class WindowConfig:
         default_factory=lambda: WindowPlacement(x=0, y=0, width=1920, height=1080)
     )
     scaling_factor: float = 1.5
-    client_offset: Optional[Tuple[int, int]] = None  # dx, dy from outer top-left to client
+    client_offset: Optional[Tuple[int, int]] = None  # (dx, dy) from outer top-left to client, in logical pixels
 
 
 @dataclass(slots=True)

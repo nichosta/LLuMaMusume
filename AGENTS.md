@@ -11,7 +11,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 - Display: 2560×1600 (16:10 aspect ratio, single monitor recommended; display scaling 150%)
 - Game: Uma Musume Pretty Derby (Steam)
 - Game mode: Windowed, positioned at (0,0) with outer size 1920×1080 (approximately 16:9)
-- Client area: 2538×1383 pixels (measured in practice)
+- Client area: ~2539×1384 physical pixels (~1693×923 logical pixels, measured in practice)
 - Locale: English (NA)
 - GPU: No dedicated GPU required
 - Admin: Not required
@@ -22,7 +22,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 - Focus/visibility: Ensure window is restored, unminimized, and foregrounded before inputs. Abort inputs if focus fails.
 - Placement: On startup, position window at `x=0, y=0` and size to `1920×1080` (outer size). Re-fetch bounds after resizing.
 - Client area origin: Use the client-area top-left as `(0,0)` for all in-game coordinates. Normalize all tool inputs and Vision outputs to this origin.
-- DPI scaling (150%): After calling `SetProcessDPIAware()` (see OS → DPI Awareness section), all window APIs return physical screen pixels. Vision outputs client-relative logical pixels, which must be multiplied by 1.5 and added to the physical client origin. See OS section for detailed conversion formulas.
+- DPI scaling (150%): After calling `SetProcessDPIAware()` (see OS → DPI Awareness section), all window APIs (`GetWindowRect`, `GetClientRect`, `ClientToScreen`) return physical screen pixels. Vision outputs client-relative logical pixels, which must be multiplied by 1.5 and added to the physical client origin. See OS section for detailed conversion formulas.
 - Bounds source: Prefer client-area bounds. If only outer bounds are available, account for title bar and borders or measure client offsets at runtime after placement.
 - Stability: Window dimensions are assumed stable during a run; refresh bounds after any explicit resize/reposition only.
 - Multi-monitor: Single monitor recommended. If multiple, require window on primary display at `(0,0)`.
@@ -49,6 +49,7 @@ Without this, at 150% DPI scaling:
 
 After setting DPI awareness:
 - pygetwindow returns window positions in **physical screen pixels**
+- `GetClientRect()` returns client dimensions in **physical screen pixels** (must divide by scaling_factor to get logical size)
 - PyAutoGUI expects coordinates in **physical screen pixels**
 - MSS operates in **physical screen pixels**
 - `config.yaml` offsets are in **logical pixels** and must be scaled
