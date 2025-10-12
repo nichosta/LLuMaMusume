@@ -22,10 +22,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 - Focus/visibility: Ensure window is restored, unminimized, and foregrounded before inputs. Abort inputs if focus fails.
 - Placement: On startup, position window at `x=0, y=0` and size to `1920×1080` (outer size). Re-fetch bounds after resizing.
 - Client area origin: Use the client-area top-left as `(0,0)` for all in-game coordinates. Normalize all tool inputs and Vision outputs to this origin.
-- DPI scaling (150%): Treat window/game coordinates as logical pixels; compute transforms:
-  - `screen_px = window_logical_px * 1.5 + client_origin_on_screen`
-  - For captures, convert crop rectangles to screen pixels using the same factor.
-  - Keep a single source of truth for `scaling_factor` (initially 1.5); measure at runtime if possible.
+- DPI scaling (150%): After calling `SetProcessDPIAware()` (see OS → DPI Awareness section), all window APIs return physical screen pixels. Vision outputs client-relative logical pixels, which must be multiplied by 1.5 and added to the physical client origin. See OS section for detailed conversion formulas.
 - Bounds source: Prefer client-area bounds. If only outer bounds are available, account for title bar and borders or measure client offsets at runtime after placement.
 - Stability: Window dimensions are assumed stable during a run; refresh bounds after any explicit resize/reposition only.
 - Multi-monitor: Single monitor recommended. If multiple, require window on primary display at `(0,0)`.
@@ -34,6 +31,40 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 # OS
 
 Handles the interactions between the rest of the code and the Uma Musume window. This comprises keyboard/mouse inputs in the actual window and window captures to be processed by Vision.
+
+## DPI Awareness
+
+**CRITICAL**: The program must call `user32.SetProcessDPIAware()` from ctypes at startup before any window or screen operations:
+
+```python
+from ctypes import windll
+user32 = windll.user32
+user32.SetProcessDPIAware()
+```
+
+Without this, at 150% DPI scaling:
+- `GetWindowRect()` returns incorrect virtualized/logical coordinates
+- PyAutoGUI mouse clicks miss their targets by significant margins
+- MSS screenshots capture wrong regions or incorrect sizes
+
+After setting DPI awareness:
+- pygetwindow returns window positions in **physical screen pixels**
+- PyAutoGUI expects coordinates in **physical screen pixels**
+- MSS operates in **physical screen pixels**
+- `config.yaml` offsets are in **logical pixels** and must be scaled
+
+**Coordinate conversion** (Vision logical → PyAutoGUI physical):
+```python
+# Vision output: (x_logical, y_logical) relative to client area
+# Config: client_offset = [6, 30] in logical pixels
+# Window position from pygetwindow: (win_x_phys, win_y_phys) in physical pixels
+
+client_origin_x_phys = win_x_phys + (client_offset[0] * 1.5)
+client_origin_y_phys = win_y_phys + (client_offset[1] * 1.5)
+
+screen_x_phys = client_origin_x_phys + (x_logical * 1.5)
+screen_y_phys = client_origin_y_phys + (y_logical * 1.5)
+```
 
 ## Input
 
@@ -87,13 +118,13 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
   - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_ratio` }.
 
 - Coordinate conversion
-  - The VLM provides normalized coords per input image (full or crop). Convert to crop pixels, then to client logical px.
-  - Steps:
-    1. `crop_px = (norm / 1000) * crop_size_px` (convert normalized 0-1000 to crop pixels)
-    2. `screen_px = crop_px + crop_origin_screen` (add crop origin in screen coordinates)
-    3. `client_logical_px = (screen_px - client_origin_on_screen) / scaling_factor` (convert to client-relative logical pixels)
-  - If a left pin strip is cropped (based on `left_pin_ratio`), add its width to the X-origin before back-projection.
-  - Note: `crop_origin_screen` is the absolute screen position of the crop's top-left; `client_origin_on_screen` is the absolute screen position of the client area's top-left.
+  - The VLM provides normalized coords per input image (full or crop). Convert to client-relative logical pixels for use by the agent/OS handler.
+  - Steps (VLM normalized → client logical px):
+    1. `crop_px = (norm / 1000) * crop_size_px` (convert normalized 0-1000 to crop-relative pixels)
+    2. `client_px = crop_px + crop_origin_within_client` (add crop origin offset within the full client capture)
+    3. `client_logical_px = client_px` (client captures are already at logical resolution)
+  - If a left pin strip is cropped (based on `left_pin_ratio`), add its width in pixels to the X-origin before back-projection.
+  - Note: The OS handler will later convert these client logical pixels to physical screen pixels for PyAutoGUI (see OS → DPI Awareness section).
 
 - Inactive/disabled UI handling
   - Heuristics: look for blur, darkening, greyed text, lock icons, and unlock-condition text; encode as `state=inactive|locked` with a brief `hint` where possible.
@@ -122,11 +153,11 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
 The Vision pipeline uses Google Gemini 2.5 Flash (as of October 2025, the latest in the Gemini series) via OpenRouter. Two prompts are used for button detection:
 
 **Menu Region Detection** (used by `get_clickable_buttons()`):
-- System: "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) to find interactive buttons. Respond with JSON listing each distinct clickable button once. Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags."
+- System: "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) to find interactive buttons. Respond with JSON listing each distinct clickable button once. Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags. IMPORTANT: If two buttons would have the same name, add a distinguishing identifier to the name itself (not just in metadata tags) so each button name is unique."
 - User: "Return a JSON object with a single property `buttons` that is an array of button records. Every record must have `label` (string) and `box_2d` (array of four floats). Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
 
 **Primary Region Detection** (used by `get_primary_elements()`):
-- System: "You analyse Uma Musume primary gameplay captures to find clickable UI elements. Return structured JSON so an agent can decide interactions. List each distinct clickable button once with its label and bounds."
+- System: "You analyse Uma Musume primary gameplay captures to find clickable UI elements. Return structured JSON so an agent can decide interactions. List each distinct clickable button once with its label and bounds. IMPORTANT: If two buttons would have the same name, add a distinguishing identifier to the name itself (not just in metadata tags) so each button name is unique."
 - User: "Respond with a JSON object that includes a `buttons` array. Each button entry must have `label` and `box_2d` fields. Avoid confidence/state/type suffixes unless they add useful hints like `|hint=New`. If no buttons exist, use an empty array."
 
 Notes:
@@ -179,11 +210,11 @@ Notes
 
 ### Input Behavior & Safety
 
-- Focus guard: Before any input, ensure the "Umamusume" window is visible and focused. If not, skip the action and surface an error to the agent.
+- Focus guard: Before any input, ensure the "Umamusume" window is visible and focused. If the window is closed or minimized, immediately terminate the program with an error.
 - Window closure: If the game window is closed for any reason, the OS handler immediately stops the program.
-- Debounce: Coalesce duplicate tool calls within 300 ms (configurable). Do not double-click unless explicitly required by the button definition.
-- Timing: Apply small randomized jitter to press/release and inter-action delays to avoid mechanical timing (configurable).
-- Rate limits: Cap actions per turn and per minute to avoid runaway loops. Exceeding limits aborts remaining inputs for the turn.
+- Timing: Apply small randomized jitter to press/release timing to avoid mechanical patterns (configurable, 20-50ms).
+- Click duration: Mouse clicks and key presses are held for 100ms to ensure registration.
+- Rate limits: One action per turn (strictly enforced). This may be increased after testing.
 - Emergency stop: Use Ctrl-C in the terminal running the main script.
 
 ### Failsafe Policy
@@ -223,7 +254,7 @@ Memory scratchpad
 - Note: The turn context budget and the memory scratchpad budget are both 32k tokens, but they are separate allocations (turn history vs. persistent memory).
 
 Safety and limits
-- Max actions per turn: 10 (default). Max actions per minute: 60 (default). Exceeding limits aborts remaining inputs.
+- One action per turn (strictly enforced). This may be increased after testing.
 - If Vision returns no actionable buttons after retries, attempt one `advanceDialogue()` then end the turn with a diagnostic (no blind inputs).
 
 # Configuration
@@ -244,10 +275,8 @@ Centralized configuration defines environment- and game-specific parameters. Use
   - `vision.parallel_calls`: true (allow per-crop prompts concurrently)
 
 - Input behavior
-  - `input.debounce_ms`: 300
   - `input.jitter_ms`: { min: 20, max: 50 }
-  - `input.max_actions_per_turn`: 10
-  - `input.max_actions_per_minute`: 60
+  - `input.max_actions_per_turn`: 1
   - `input.allow_skip_cinematics`: false
 
 - Turns & timeouts

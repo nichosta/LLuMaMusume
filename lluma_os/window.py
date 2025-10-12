@@ -1,4 +1,10 @@
-"""Window management utilities tailored for Uma Musume on Windows."""
+"""Window management utilities tailored for Uma Musume on Windows.
+
+IMPORTANT: Call set_dpi_aware() once at program startup before creating
+any UmaWindow instances or performing window/screen operations. Without
+DPI awareness, window coordinates and mouse operations will be incorrect
+on displays with scaling != 100%.
+"""
 from __future__ import annotations
 
 import logging
@@ -25,6 +31,25 @@ else:  # pragma: no cover - used only when running tooling on non-Windows hosts
     gw = None  # type: ignore
     ctypes = None  # type: ignore
     wintypes = None  # type: ignore
+
+
+def set_dpi_aware() -> None:
+    """Enable DPI awareness for accurate window coordinates and mouse input.
+
+    MUST be called once at program startup before any window or screen operations.
+    Without this, GetWindowRect() returns incorrect virtualized coordinates and
+    PyAutoGUI clicks will miss their targets on displays with scaling != 100%.
+
+    This function is safe to call multiple times and is a no-op on non-Windows platforms.
+    """
+    if not _IS_WINDOWS:
+        return
+
+    try:
+        assert ctypes is not None  # noqa: S101 - guarded by _IS_WINDOWS
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logging.getLogger(__name__).warning("Failed to set DPI awareness: %s", exc)
 
 
 class WindowNotFoundError(RuntimeError):
@@ -90,15 +115,21 @@ class ClientArea:
         return self.physical_size
 
     def logical_to_screen(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert logical client coordinates into screen pixel coordinates."""
+        """Convert logical client coordinates into physical screen pixel coordinates.
 
+        Assumes set_dpi_aware() was called at program startup; otherwise these
+        physical coordinates will be incorrect on displays with scaling != 100%.
+        """
         origin_x, origin_y = self.screen_origin
         scale = self.scaling_factor
         return int(round(origin_x + x * scale)), int(round(origin_y + y * scale))
 
     def screen_to_logical(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert absolute screen pixel coordinates into logical client coordinates."""
+        """Convert absolute physical screen pixel coordinates into logical client coordinates.
 
+        Assumes set_dpi_aware() was called at program startup; otherwise the
+        input coordinates must already be physical pixels for correct conversion.
+        """
         origin_x, origin_y = self.screen_origin
         scale = self.scaling_factor
         return int(round((x - origin_x) / scale)), int(round((y - origin_y) / scale))
@@ -328,4 +359,5 @@ __all__ = [
     "WindowGeometry",
     "WindowFocusError",
     "WindowNotFoundError",
+    "set_dpi_aware",
 ]
