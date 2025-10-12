@@ -311,7 +311,9 @@ class MenuAnalyzer:
             "to find interactive buttons. Respond with JSON listing each distinct clickable button once. "
             "Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] "
             "with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; "
-            "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags."
+            "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags. "
+            "IMPORTANT: If two buttons would have the same name, add a distinguishing identifier to the name itself "
+            "(not just in metadata tags) so each button name is unique."
         )
 
         user_instructions = (
@@ -363,7 +365,9 @@ class MenuAnalyzer:
         system_prompt = (
             "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
             "Return structured JSON so an agent can decide interactions. "
-            "List each distinct clickable button once with its label and bounds."
+            "List each distinct clickable button once with its label and bounds. "
+            "IMPORTANT: If two buttons would have the same name, add a distinguishing identifier to the name itself "
+            "(not just in metadata tags) so each button name is unique."
         )
 
         user_instructions = (

@@ -1,4 +1,10 @@
-"""Window management utilities tailored for Uma Musume on Windows."""
+"""Window management utilities tailored for Uma Musume on Windows.
+
+IMPORTANT: Call set_dpi_aware() once at program startup before creating
+any UmaWindow instances or performing window/screen operations. Without
+DPI awareness, window coordinates and mouse operations will be incorrect
+on displays with scaling != 100%.
+"""
 from __future__ import annotations
 
 import logging
@@ -25,6 +31,25 @@ else:  # pragma: no cover - used only when running tooling on non-Windows hosts
     gw = None  # type: ignore
     ctypes = None  # type: ignore
     wintypes = None  # type: ignore
+
+
+def set_dpi_aware() -> None:
+    """Enable DPI awareness for accurate window coordinates and mouse input.
+
+    MUST be called once at program startup before any window or screen operations.
+    Without this, GetWindowRect() returns incorrect virtualized coordinates and
+    PyAutoGUI clicks will miss their targets on displays with scaling != 100%.
+
+    This function is safe to call multiple times and is a no-op on non-Windows platforms.
+    """
+    if not _IS_WINDOWS:
+        return
+
+    try:
+        assert ctypes is not None  # noqa: S101 - guarded by _IS_WINDOWS
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception as exc:  # pragma: no cover - defensive guard
+        logging.getLogger(__name__).warning("Failed to set DPI awareness: %s", exc)
 
 
 class WindowNotFoundError(RuntimeError):
@@ -90,15 +115,21 @@ class ClientArea:
         return self.physical_size
 
     def logical_to_screen(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert logical client coordinates into screen pixel coordinates."""
+        """Convert logical client coordinates into physical screen pixel coordinates.
 
+        Assumes set_dpi_aware() was called at program startup; otherwise these
+        physical coordinates will be incorrect on displays with scaling != 100%.
+        """
         origin_x, origin_y = self.screen_origin
         scale = self.scaling_factor
         return int(round(origin_x + x * scale)), int(round(origin_y + y * scale))
 
     def screen_to_logical(self, x: float, y: float) -> Tuple[int, int]:
-        """Convert absolute screen pixel coordinates into logical client coordinates."""
+        """Convert absolute physical screen pixel coordinates into logical client coordinates.
 
+        Assumes set_dpi_aware() was called at program startup; otherwise the
+        input coordinates must already be physical pixels for correct conversion.
+        """
         origin_x, origin_y = self.screen_origin
         scale = self.scaling_factor
         return int(round((x - origin_x) / scale)), int(round((y - origin_y) / scale))
@@ -106,7 +137,11 @@ class ClientArea:
 
 @dataclass(slots=True)
 class WindowGeometry:
-    """Aggregated geometry data for the Uma Musume window."""
+    """Aggregated geometry data for the Uma Musume window.
+
+    Note: outer_rect contains physical screen pixels (from pygetwindow after DPI awareness).
+    Client area provides both logical and physical sizes/conversions.
+    """
 
     outer_rect: Rect
     client_area: ClientArea
@@ -226,14 +261,20 @@ class UmaWindow:
         if not ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect)):
             raise ctypes.WinError()  # pragma: no cover - direct system failure
 
-        logical_width = max(int(rect.right - rect.left), 1)
-        logical_height = max(int(rect.bottom - rect.top), 1)
+        # IMPORTANT: After SetProcessDPIAware(), GetClientRect returns PHYSICAL pixel dimensions
+        physical_width = max(int(rect.right - rect.left), 1)
+        physical_height = max(int(rect.bottom - rect.top), 1)
+
+        # Divide by scaling factor to get logical dimensions
+        scaling_factor = self._config.scaling_factor
+        logical_width = max(int(round(physical_width / scaling_factor)), 1)
+        logical_height = max(int(round(physical_height / scaling_factor)), 1)
 
         config_offset = self._config.client_offset
         if config_offset is not None:
-            scale = self._config.scaling_factor
-            offset_x = int(round(config_offset[0] * scale))
-            offset_y = int(round(config_offset[1] * scale))
+            # Config offset is in logical pixels, scale to physical
+            offset_x = int(round(config_offset[0] * scaling_factor))
+            offset_y = int(round(config_offset[1] * scaling_factor))
             screen_origin = (int(window.left + offset_x), int(window.top + offset_y))
         else:
             point = wintypes.POINT(0, 0)
@@ -241,9 +282,6 @@ class UmaWindow:
                 raise ctypes.WinError()  # pragma: no cover
 
             screen_origin = (int(point.x), int(point.y))
-        scaling_factor = self._config.scaling_factor
-        physical_width = max(int(round(logical_width * scaling_factor)), 1)
-        physical_height = max(int(round(logical_height * scaling_factor)), 1)
 
         return ClientArea(
             screen_origin=screen_origin,
@@ -260,6 +298,7 @@ class UmaWindow:
         self._require_windows()
         assert ctypes is not None  # noqa: S101
 
+        # GetSystemMetrics returns physical pixels after SetProcessDPIAware()
         screen_width = ctypes.windll.user32.GetSystemMetrics(0)
         screen_height = ctypes.windll.user32.GetSystemMetrics(1)
         screen_bounds = (screen_width, screen_height)
@@ -328,4 +367,5 @@ __all__ = [
     "WindowGeometry",
     "WindowFocusError",
     "WindowNotFoundError",
+    "set_dpi_aware",
 ]
