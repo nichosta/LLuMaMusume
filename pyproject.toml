@@ -5,3 +5,6 @@ description = "Experimental harness for Uma Musume gameplay on Windows by an LLM
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
