@@ -1,5 +1,7 @@
 captures
-**/__pycache__/**
+memory
+logs
+**/__pycache__
 .venv
 .claude
 

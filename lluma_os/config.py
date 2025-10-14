@@ -79,15 +79,30 @@ class CaptureConfig:
     scaling_factor: float = 1.5
 
 
-def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig]:
-    """Load window and capture configuration from YAML, falling back to defaults."""
+@dataclass(slots=True)
+class AgentConfig:
+    """Agent and LLM configuration."""
+
+    model: str = "google/gemini-flash-2.5-latest"
+    memory_dir: Path = Path("memory")
+    logs_dir: Path = Path("logs")
+    max_memory_tokens: int = 32000
+    max_context_tokens: int = 32000
+    request_timeout_s: int = 30
+    turn_post_padding_s: float = 5.0
+    allow_skip_cinematics: bool = False
+
+
+def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
+    """Load window, capture, and agent configuration from YAML, falling back to defaults."""
 
     cfg_path = path or Path("config.yaml")
     window_cfg = WindowConfig()
     capture_cfg = CaptureConfig()
+    agent_cfg = AgentConfig()
 
     if not cfg_path.exists():
-        return window_cfg, capture_cfg
+        return window_cfg, capture_cfg, agent_cfg
 
     with cfg_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
@@ -101,7 +116,10 @@ def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConf
     if capture_scaling_override is None:
         capture_cfg.scaling_factor = window_cfg.scaling_factor
 
-    return window_cfg, capture_cfg
+    agent_data = raw.get("agent", {})
+    _apply_agent_config(agent_cfg, agent_data)
+
+    return window_cfg, capture_cfg, agent_cfg
 
 
 def _apply_window_config(config: WindowConfig, data: Dict) -> None:
@@ -184,6 +202,35 @@ def _apply_capture_config(config: CaptureConfig, data: Dict) -> None:
         config.retention.max_captures = int(retention_data["max_captures"])
 
 
+def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
+    if not data:
+        return
+
+    if "model" in data:
+        config.model = str(data["model"])
+
+    if "memory_dir" in data:
+        config.memory_dir = Path(str(data["memory_dir"]))
+
+    if "logs_dir" in data:
+        config.logs_dir = Path(str(data["logs_dir"]))
+
+    if "max_memory_tokens" in data:
+        config.max_memory_tokens = int(data["max_memory_tokens"])
+
+    if "max_context_tokens" in data:
+        config.max_context_tokens = int(data["max_context_tokens"])
+
+    if "request_timeout_s" in data:
+        config.request_timeout_s = int(data["request_timeout_s"])
+
+    if "turn_post_padding_s" in data:
+        config.turn_post_padding_s = float(data["turn_post_padding_s"])
+
+    if "allow_skip_cinematics" in data:
+        config.allow_skip_cinematics = bool(data["allow_skip_cinematics"])
+
+
 __all__ = [
     "WindowPlacement",
     "WindowConfig",
@@ -191,5 +238,6 @@ __all__ = [
     "CaptureValidationConfig",
     "RetentionConfig",
     "CaptureConfig",
+    "AgentConfig",
     "load_configs",
 ]

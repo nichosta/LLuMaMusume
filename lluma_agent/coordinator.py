@@ -1,0 +1,440 @@
+"""Main game loop coordinator that orchestrates all subsystems."""
+from __future__ import annotations
+
+import json
+import logging
+import signal
+import sys
+import time
+from dataclasses import asdict
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from lluma_os.capture import CaptureManager, CaptureError
+from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
+from lluma_os.input_handler import (
+    ButtonNotFoundError,
+    InputConfig,
+    InputHandler,
+    ScrollbarNotFoundError,
+    VisionOutput,
+    WindowStateError,
+    parse_button_label,
+)
+from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
+from lluma_vision.menu_analyzer import MenuAnalyzer
+
+from .agent import AgentError, UmaAgent, VisionData
+from .memory import MemoryManager
+
+Logger = logging.Logger
+
+
+class CoordinatorError(RuntimeError):
+    """Raised when coordinator encounters unrecoverable errors."""
+
+
+class GameLoopCoordinator:
+    """Orchestrates the main game loop: capture → vision → agent → input."""
+
+    def __init__(
+        self,
+        window_config: WindowConfig,
+        capture_config: CaptureConfig,
+        agent_config: AgentConfig,
+        logger: Optional[Logger] = None,
+    ) -> None:
+        """Initialize the coordinator and all subsystems.
+
+        Args:
+            window_config: Window management configuration
+            capture_config: Screenshot capture configuration
+            agent_config: Agent and LLM configuration
+            logger: Optional logger instance
+        """
+        self._logger = logger or logging.getLogger(__name__)
+        self._agent_config = agent_config
+        self._should_stop = False
+        self._turn_counter = 0
+
+        # Ensure DPI awareness is set before any window operations
+        set_dpi_aware()
+
+        # Create output directories
+        agent_config.memory_dir.mkdir(parents=True, exist_ok=True)
+        agent_config.logs_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize subsystems
+        self._logger.info("Initializing subsystems...")
+
+        self._window = UmaWindow(window_config, logger=self._logger)
+        self._capture = CaptureManager(self._window, capture_config, logger=self._logger)
+        self._vision = MenuAnalyzer(logger=self._logger)
+        self._memory = MemoryManager(
+            agent_config.memory_dir,
+            max_tokens=agent_config.max_memory_tokens,
+            logger=self._logger,
+        )
+        self._agent = UmaAgent(
+            self._memory,
+            model=agent_config.model,
+            max_context_tokens=agent_config.max_context_tokens,
+            logger=self._logger,
+        )
+        self._input_handler = InputHandler(
+            self._window,
+            config=InputConfig(),
+            logger=self._logger,
+        )
+
+        # Register signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._handle_signal)
+        signal.signal(signal.SIGTERM, self._handle_signal)
+
+        self._logger.info("Coordinator initialized successfully")
+
+    def run(self, reposition: bool = True) -> None:
+        """Run the main game loop until stopped.
+
+        Args:
+            reposition: Whether to reposition window on first turn
+        """
+        self._logger.info("Starting game loop (reposition=%s)", reposition)
+        first_turn = True
+
+        try:
+            while not self._should_stop:
+                self._execute_turn(reposition=first_turn and reposition)
+                first_turn = False
+
+                # Post-turn padding
+                if not self._should_stop:
+                    time.sleep(self._agent_config.turn_post_padding_s)
+
+        except KeyboardInterrupt:
+            self._logger.info("Received keyboard interrupt, stopping gracefully")
+        except WindowNotFoundError:
+            self._logger.error("Game window closed; terminating immediately")
+            sys.exit(1)
+        except Exception as exc:
+            self._logger.exception("Unhandled exception in game loop: %s", exc)
+            raise CoordinatorError("Game loop failed") from exc
+        finally:
+            self._logger.info("Game loop terminated")
+
+    def _execute_turn(self, reposition: bool = False) -> None:
+        """Execute a single turn of the game loop.
+
+        Args:
+            reposition: Whether to reposition the window before capture
+        """
+        self._turn_counter += 1
+        turn_id = f"turn_{self._turn_counter:06d}"
+        self._logger.info("=" * 60)
+        self._logger.info("Starting %s", turn_id)
+
+        turn_log: Dict[str, Any] = {
+            "turn_id": turn_id,
+            "timestamp": datetime.now().isoformat(),
+            "reposition": reposition,
+        }
+
+        try:
+            # Step 1: Capture
+            self._logger.info("Capturing screenshots...")
+            capture_result = self._capture.capture(turn_id, reposition=reposition)
+            turn_log["capture"] = {
+                "raw_path": str(capture_result.raw_path),
+                "primary_path": str(capture_result.primary_path) if capture_result.primary_path else None,
+                "menus_path": str(capture_result.menus_path) if capture_result.menus_path else None,
+                "validation": asdict(capture_result.validation),
+            }
+
+            # Step 2: Vision processing
+            self._logger.info("Processing vision data...")
+            vision_data = self._process_vision(capture_result)
+            turn_log["vision"] = {
+                "buttons": vision_data.buttons,
+                "scrollbar": vision_data.scrollbar,
+                "menu_state": vision_data.menu_state,
+            }
+
+            # Check for no buttons (failsafe condition)
+            if not vision_data.buttons:
+                self._logger.warning("No buttons detected; attempting failsafe advanceDialogue")
+                turn_log["failsafe"] = "no_buttons_detected"
+                self._execute_failsafe_action(capture_result)
+                self._save_turn_log(turn_id, turn_log)
+                return
+
+            # Step 3: Agent reasoning
+            self._logger.info("Calling agent for decision...")
+            turn_result = self._agent.execute_turn(
+                turn_id=turn_id,
+                vision_data=vision_data,
+                primary_screenshot=capture_result.primary_path or capture_result.raw_path,
+                menus_screenshot=capture_result.menus_path,
+            )
+            turn_log["agent"] = {
+                "reasoning": turn_result.reasoning,
+                "memory_actions": [
+                    {"name": a["name"], "args_keys": list(a["arguments"].keys())}
+                    for a in turn_result.memory_actions
+                ],
+                "input_action": turn_result.input_action,
+                "execution_results": turn_result.execution_results,
+            }
+
+            # Step 4: Execute input action
+            if turn_result.input_action:
+                self._logger.info("Executing input action: %s", turn_result.input_action["name"])
+                result = self._execute_input_action(turn_result.input_action, vision_data, capture_result)
+                turn_log["input_execution"] = result
+            else:
+                self._logger.info("No input action from agent")
+                turn_log["input_execution"] = {"status": "no_action"}
+
+        except CaptureError as exc:
+            self._logger.error("Capture failed: %s", exc)
+            turn_log["error"] = {"type": "capture", "message": str(exc)}
+        except AgentError as exc:
+            self._logger.error("Agent failed: %s", exc)
+            turn_log["error"] = {"type": "agent", "message": str(exc)}
+        except Exception as exc:
+            self._logger.exception("Turn execution failed: %s", exc)
+            turn_log["error"] = {"type": "unknown", "message": str(exc)}
+        finally:
+            self._save_turn_log(turn_id, turn_log)
+            self._logger.info("Completed %s", turn_id)
+
+    def _process_vision(self, capture_result: Any) -> VisionData:
+        """Process vision data from capture results.
+
+        Args:
+            capture_result: CaptureResult object from capture manager
+
+        Returns:
+            VisionData for agent consumption
+        """
+        buttons = []
+        scrollbar_info = None
+        menu_state_dict: Dict[str, Any] = {
+            "is_usable": False,
+            "selected_tab": None,
+            "tabs": [],
+            "available_tabs": [],
+        }
+
+        # Process menus region
+        if capture_result.menus_path and capture_result.menus_path.exists():
+            # Menu state analysis
+            menu_state = self._vision.analyze_menu(capture_result.menus_image)
+            menu_state_dict = {
+                "is_usable": menu_state.is_usable,
+                "selected_tab": menu_state.selected_tab,
+                "tabs": [
+                    {"name": t.name, "is_selected": t.is_selected, "availability": t.availability.value}
+                    for t in menu_state.tabs
+                ],
+                "available_tabs": menu_state.available_tabs(),
+            }
+
+            # Button detection in menus
+            if menu_state.is_usable:
+                menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                for btn_raw in menu_buttons_raw:
+                    name, metadata = parse_button_label(btn_raw["label"])
+                    buttons.append({
+                        "name": name,
+                        "full_label": btn_raw["label"],
+                        "bounds": btn_raw["box_2d"],
+                        "metadata": metadata,
+                        "region": "menus",
+                    })
+
+        # Process primary region
+        if capture_result.primary_path and capture_result.primary_path.exists():
+            # Button detection
+            primary_buttons_raw = self._vision.get_primary_elements(str(capture_result.primary_path))
+            for btn_raw in primary_buttons_raw:
+                name, metadata = parse_button_label(btn_raw["label"])
+                buttons.append({
+                    "name": name,
+                    "full_label": btn_raw["label"],
+                    "bounds": btn_raw["box_2d"],
+                    "metadata": metadata,
+                    "region": "primary",
+                })
+
+            # Scrollbar detection
+            scrollbar = self._vision.detect_primary_scrollbar(capture_result.primary_image)
+            if scrollbar:
+                scrollbar_info = {
+                    "track_bounds": scrollbar.track_bounds,
+                    "thumb_bounds": scrollbar.thumb_bounds,
+                    "can_scroll_up": scrollbar.can_scroll_up,
+                    "can_scroll_down": scrollbar.can_scroll_down,
+                    "thumb_ratio": scrollbar.thumb_ratio,
+                }
+
+        return VisionData(
+            buttons=buttons,
+            scrollbar=scrollbar_info,
+            menu_state=menu_state_dict,
+        )
+
+    def _execute_input_action(
+        self, action: Dict[str, Any], vision_data: VisionData, capture_result: Any
+    ) -> Dict[str, str]:
+        """Execute an input action via the input handler.
+
+        Args:
+            action: Action dictionary with 'name' and 'arguments'
+            vision_data: Vision data for the turn
+            capture_result: Capture result for geometry
+
+        Returns:
+            Dictionary with status and optional error message
+        """
+        action_name = action["name"]
+        args = action.get("arguments", {})
+
+        # Build VisionOutput for input handler
+        button_infos = []
+        for btn in vision_data.buttons:
+            from lluma_os.input_handler import ButtonInfo
+
+            button_infos.append(
+                ButtonInfo(
+                    name=btn["name"],
+                    full_label=btn["full_label"],
+                    bounds=tuple(btn["bounds"]),  # type: ignore
+                    metadata=btn["metadata"],
+                )
+            )
+
+        scrollbar_for_handler = None
+        if vision_data.scrollbar:
+            from lluma_os.input_handler import ScrollbarInfo
+
+            scrollbar_for_handler = ScrollbarInfo(
+                track_bounds=tuple(vision_data.scrollbar["track_bounds"]),  # type: ignore
+                thumb_bounds=tuple(vision_data.scrollbar["thumb_bounds"]),  # type: ignore
+                can_scroll_up=vision_data.scrollbar["can_scroll_up"],
+                can_scroll_down=vision_data.scrollbar["can_scroll_down"],
+                thumb_ratio=vision_data.scrollbar["thumb_ratio"],
+            )
+
+        # Primary center (use center of primary image)
+        if capture_result.primary_image:
+            w, h = capture_result.primary_image.size
+            primary_center = (w // 2, h // 2)
+        else:
+            primary_center = (500, 500)  # Fallback
+
+        vision_output = VisionOutput(
+            buttons=button_infos,
+            scrollbar=scrollbar_for_handler,
+            primary_center=primary_center,
+        )
+
+        # Update input handler state
+        self._input_handler.update_vision_state(vision_output, capture_result.geometry)
+
+        # Execute action
+        try:
+            if action_name == "pressButton":
+                button_name = args["name"]
+                self._input_handler.press_button(button_name)
+                return {"status": "success", "action": f"pressButton({button_name})"}
+
+            elif action_name == "advanceDialogue":
+                self._input_handler.advance_dialogue()
+                return {"status": "success", "action": "advanceDialogue()"}
+
+            elif action_name == "back":
+                self._input_handler.back()
+                return {"status": "success", "action": "back()"}
+
+            elif action_name == "confirm":
+                self._input_handler.confirm()
+                return {"status": "success", "action": "confirm()"}
+
+            elif action_name == "scrollUp":
+                self._input_handler.scroll_up()
+                return {"status": "success", "action": "scrollUp()"}
+
+            elif action_name == "scrollDown":
+                self._input_handler.scroll_down()
+                return {"status": "success", "action": "scrollDown()"}
+
+            else:
+                return {"status": "error", "message": f"Unknown action: {action_name}"}
+
+        except ButtonNotFoundError as exc:
+            self._logger.error("Button not found: %s", exc)
+            return {"status": "error", "message": str(exc)}
+        except ScrollbarNotFoundError as exc:
+            self._logger.error("Scrollbar not found: %s", exc)
+            return {"status": "error", "message": str(exc)}
+        except WindowStateError as exc:
+            self._logger.error("Window state error: %s", exc)
+            return {"status": "error", "message": str(exc)}
+        except Exception as exc:
+            self._logger.exception("Input action failed: %s", exc)
+            return {"status": "error", "message": str(exc)}
+
+    def _execute_failsafe_action(self, capture_result: Any) -> None:
+        """Execute failsafe advanceDialogue when no buttons detected.
+
+        Args:
+            capture_result: Capture result for geometry
+        """
+        try:
+            # Build minimal VisionOutput with no buttons
+            if capture_result.primary_image:
+                w, h = capture_result.primary_image.size
+                primary_center = (w // 2, h // 2)
+            else:
+                primary_center = (500, 500)
+
+            vision_output = VisionOutput(
+                buttons=[],
+                scrollbar=None,
+                primary_center=primary_center,
+            )
+
+            self._input_handler.update_vision_state(vision_output, capture_result.geometry)
+            self._input_handler.advance_dialogue()
+            self._logger.info("Failsafe advanceDialogue executed successfully")
+
+        except Exception as exc:
+            self._logger.error("Failsafe action failed: %s", exc)
+
+    def _save_turn_log(self, turn_id: str, log_data: Dict[str, Any]) -> None:
+        """Save turn log to JSON file.
+
+        Args:
+            turn_id: Turn identifier
+            log_data: Log data dictionary
+        """
+        log_path = self._agent_config.logs_dir / f"{turn_id}.json"
+        try:
+            with log_path.open("w", encoding="utf-8") as f:
+                json.dump(log_data, f, indent=2)
+        except Exception as exc:
+            self._logger.error("Failed to save turn log: %s", exc)
+
+    def _handle_signal(self, signum: int, frame: Any) -> None:
+        """Handle termination signals gracefully.
+
+        Args:
+            signum: Signal number
+            frame: Current stack frame
+        """
+        self._logger.info("Received signal %d, stopping after current turn", signum)
+        self._should_stop = True
+
+
+__all__ = ["GameLoopCoordinator", "CoordinatorError"]
