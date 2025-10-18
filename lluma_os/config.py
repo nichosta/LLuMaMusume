@@ -83,7 +83,7 @@ class CaptureConfig:
 class AgentConfig:
     """Agent and LLM configuration."""
 
-    model: str = "google/gemini-flash-2.5-latest"
+    model: str = "anthropic/claude-haiku-4.5"
     memory_dir: Path = Path("memory")
     logs_dir: Path = Path("logs")
     max_memory_tokens: int = 32000

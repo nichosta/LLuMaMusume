@@ -3,7 +3,7 @@ pygetwindow
 mss
 pillow
 numpy
-openai
+requests
 pyyaml
 
 # Optional (uncomment as needed)

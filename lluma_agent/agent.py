@@ -11,12 +11,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import requests
 from PIL import Image
-
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None  # type: ignore[assignment]
 
 from .memory import MemoryManager, MemoryError
 from .prompts import AGENT_SYSTEM_PROMPT
@@ -56,7 +52,8 @@ class UmaAgent:
     def __init__(
         self,
         memory_manager: MemoryManager,
-        model: str = "google/gemini-flash-2.5-latest",
+        # model: str = "google/gemini-flash-2.5-latest",
+        model: str = "anthropic/claude-haiku-4.5",
         max_context_tokens: int = 32000,
         logger: Optional[Logger] = None,
     ) -> None:
@@ -70,13 +67,14 @@ class UmaAgent:
         """
         self._memory = memory_manager
         self._logger = logger or logging.getLogger(__name__)
-        self._client: Optional[Any] = None
+        self._api_key: str = ""
+        self._headers: Dict[str, str] = {}
         self._turn_history: List[str] = []
         self._model = model
         self._max_context_tokens = max_context_tokens
 
-        # Initialize OpenRouter client
-        self._init_client()
+        # Initialize OpenRouter API configuration
+        self._init_api()
 
     def execute_turn(
         self,
@@ -124,21 +122,30 @@ class UmaAgent:
 
         # Call LLM
         try:
-            response = self._client.chat.completions.create(
-                model=self._model,
-                messages=[
+            payload = {
+                "model": self._model,
+                "messages": [
                     {"role": "system", "content": AGENT_SYSTEM_PROMPT},
                     {"role": "user", "content": message_content},
                 ],
-                tools=ALL_TOOLS,
-                tool_choice="auto",
+                "tools": ALL_TOOLS,
+                "tool_choice": "auto",
+            }
+
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=self._headers,
+                json=payload,
+                timeout=60,
             )
+            response.raise_for_status()
+            response_data = response.json()
         except Exception as exc:
             raise AgentError(f"LLM request failed: {exc}") from exc
 
         # Extract reasoning and tool calls
-        reasoning = self._extract_reasoning(response)
-        tool_calls = self._extract_tool_calls(response)
+        reasoning = self._extract_reasoning(response_data)
+        tool_calls = self._extract_tool_calls(response_data)
 
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
@@ -271,24 +278,20 @@ class UmaAgent:
         else:
             raise AgentError(f"Unknown memory tool: {name}")
 
-    def _init_client(self) -> None:
-        """Initialize OpenRouter client."""
-        if OpenAI is None:
-            raise ImportError("openai package required; install with `pip install openai`")
-
+    def _init_api(self) -> None:
+        """Initialize OpenRouter API configuration."""
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable not set")
 
-        self._client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-            default_headers={
-                "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
-                "X-Title": "LLuMa Musume Agent",
-            },
-        )
-        self._logger.info("Initialized OpenRouter client with model: %s", self._model)
+        self._api_key = api_key
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+            "X-Title": "LLuMa Musume Agent",
+            "Content-Type": "application/json",
+        }
+        self._logger.info("Initialized OpenRouter API with model: %s", self._model)
 
     def _encode_image(self, image_path: Path) -> str:
         """Encode image to base64 data URL.
@@ -305,43 +308,43 @@ class UmaAgent:
                 b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
                 return f"data:image/png;base64,{b64}"
 
-    def _extract_reasoning(self, response: Any) -> str:
+    def _extract_reasoning(self, response: Dict[str, Any]) -> str:
         """Extract reasoning text from LLM response.
 
         Args:
-            response: OpenAI response object
+            response: OpenRouter API response dict
 
         Returns:
             Reasoning text
         """
         try:
-            message = response.choices[0].message
-            content = getattr(message, "content", None)
+            message = response["choices"][0]["message"]
+            content = message.get("content")
             return content.strip() if content else "(No reasoning provided)"
         except Exception as exc:
             self._logger.warning("Failed to extract reasoning: %s", exc)
             return "(Failed to extract reasoning)"
 
-    def _extract_tool_calls(self, response: Any) -> List[Dict[str, Any]]:
+    def _extract_tool_calls(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract tool calls from LLM response.
 
         Args:
-            response: OpenAI response object
+            response: OpenRouter API response dict
 
         Returns:
             List of tool call dictionaries with 'name' and 'arguments' keys
         """
         try:
-            message = response.choices[0].message
-            tool_calls = getattr(message, "tool_calls", None)
+            message = response["choices"][0]["message"]
+            tool_calls = message.get("tool_calls")
             if not tool_calls:
                 return []
 
             calls = []
             for tc in tool_calls:
-                function = tc.function
-                name = function.name
-                args_str = function.arguments
+                function = tc["function"]
+                name = function["name"]
+                args_str = function["arguments"]
 
                 # Parse arguments JSON
                 try:
