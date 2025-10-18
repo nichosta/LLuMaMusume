@@ -76,7 +76,8 @@ capture:
   split:
     left_pin_ratio: 0.07874
     primary_ratio: 0.42126
-    menus_ratio: 0.50
+    menus_ratio: 0.42126
+    tabs_ratio: 0.07874
 
 agent:
   model: "google/gemini-flash-2.5-latest"
@@ -94,6 +95,7 @@ agent:
 - `captures/turn_XXXXXX.png` - Full client-area capture
 - `captures/turn_XXXXXX-primary.png` - Primary gameplay region
 - `captures/turn_XXXXXX-menus.png` - Menu/UI region
+- `captures/turn_XXXXXX-tabs.png` - Tab column region
 
 ### Turn Logs
 - `logs/turn_XXXXXX.json` - Detailed turn data (vision, reasoning, actions, results)

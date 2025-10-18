@@ -5,6 +5,7 @@ pillow
 numpy
 requests
 pyyaml
+pytest
 
 # Optional (uncomment as needed)
 # keyboard

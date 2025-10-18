@@ -89,11 +89,19 @@ class MenuAnalyzer:
         self._api_key: Optional[str] = None
         self._headers: Optional[Dict[str, str]] = None
 
-    def analyze_menu(self, menu_image: Image.Image) -> MenuState:
-        """Analyze a menu section image and return the menu state."""
-        
+    def analyze_menu(self, menu_image: Image.Image, tabs_image: Optional[Image.Image] = None) -> MenuState:
+        """Analyze a menu section image and return the menu state.
+
+        Args:
+            menu_image: Cropped menu content pane (without left pin or tabs).
+            tabs_image: Optional crop that isolates the vertical tab list.
+        """
+
         # Step 1: Check if menu is usable (not blurred)
         is_usable = self._detect_usability(menu_image)
+        tab_reference = tabs_image or menu_image
+        if tab_reference is None:
+            tab_reference = menu_image
         
         if not is_usable:
             # If blurred, we can't reliably detect tab states
@@ -104,10 +112,10 @@ class MenuAnalyzer:
             )
         
         # Step 2: Detect selected tab (green highlight)
-        selected_tab = self._detect_selected_tab(menu_image)
+        selected_tab = self._detect_selected_tab(tab_reference)
         
         # Step 3: Detect available tabs (white vs gray boxes)
-        tab_availabilities = self._detect_tab_availability(menu_image)
+        tab_availabilities = self._detect_tab_availability(tab_reference)
         
         # Build tab info list
         tabs = []
@@ -217,8 +225,7 @@ class MenuAnalyzer:
         img_array = np.asarray(image)
         height, width = img_array.shape[:2]
         
-        # For availability detection, focus on the button backing near the right edge.
-        # The active/inactive fill sits in the last ~15% of the menu pane (mirrors left_pin ratio overall).
+        # Focus on the right edge backing where the active/inactive fill resides.
         tab_width = max(int(width * 0.15), 1)
         tab_region_start = max(width - tab_width, 0)
         tab_region_end = width
@@ -268,7 +275,7 @@ class MenuAnalyzer:
         # Available tabs: rgb_balance > 0.040 OR brightness > 230
         # Unavailable tabs: rgb_balance <= 0.040 AND brightness <= 230
         balance_threshold = 0.075
-        brightness_threshold = 230.0
+        brightness_threshold = 225.0
         
         if rgb_balance > balance_threshold or brightness > brightness_threshold:
             if brightness > brightness_threshold:
@@ -276,7 +283,7 @@ class MenuAnalyzer:
                 region_gray = np.dot(region[..., :3], [0.299, 0.587, 0.114])
                 gy, gx = np.gradient(region_gray)
                 edge_strength = float(np.mean(np.sqrt(gx * gx + gy * gy)))
-                edge_threshold = 0.3
+                edge_threshold = 0.04
 
                 if edge_strength < edge_threshold:
                     return TabAvailability.UNAVAILABLE

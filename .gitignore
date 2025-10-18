@@ -3,7 +3,9 @@ memory
 logs
 **/__pycache__
 .venv
+.pytest_cache
 .claude
+wsl2
 
 # Debug and temporary files (kept for reference but not tracked)
 debug_temp/

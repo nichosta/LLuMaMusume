@@ -148,6 +148,7 @@ class GameLoopCoordinator:
                 "raw_path": str(capture_result.raw_path),
                 "primary_path": str(capture_result.primary_path) if capture_result.primary_path else None,
                 "menus_path": str(capture_result.menus_path) if capture_result.menus_path else None,
+                "tabs_path": str(capture_result.tabs_path) if capture_result.tabs_path else None,
                 "validation": asdict(capture_result.validation),
             }
 
@@ -227,9 +228,16 @@ class GameLoopCoordinator:
         }
 
         # Process menus region
-        if capture_result.menus_path and capture_result.menus_path.exists():
+        if (
+            capture_result.menus_path
+            and capture_result.menus_path.exists()
+            and capture_result.menus_image is not None
+        ):
             # Menu state analysis
-            menu_state = self._vision.analyze_menu(capture_result.menus_image)
+            menu_state = self._vision.analyze_menu(
+                capture_result.menus_image,
+                tabs_image=capture_result.tabs_image,
+            )
             menu_state_dict = {
                 "is_usable": menu_state.is_usable,
                 "selected_tab": menu_state.selected_tab,
