@@ -9,7 +9,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from lluma_os.capture import CaptureManager, CaptureError
 from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
@@ -24,11 +24,67 @@ from lluma_os.input_handler import (
 )
 from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
 from lluma_vision.menu_analyzer import MenuAnalyzer
+from PIL import Image
 
 from .agent import AgentError, UmaAgent, VisionData
 from .memory import MemoryManager
 
 Logger = logging.Logger
+
+
+def convert_vlm_box_to_pixels(vlm_box: list, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
+    """Convert VLM normalized box to pixel coordinates.
+
+    VLM outputs boxes as [ymin, xmin, ymax, xmax] in 0-1000 range.
+    This converts to [x, y, width, height] in pixels.
+
+    Args:
+        vlm_box: VLM box in [ymin, xmin, ymax, xmax] format (0-1000 range)
+        image_width: Width of the image in pixels
+        image_height: Height of the image in pixels
+
+    Returns:
+        (x, y, width, height) in pixels
+    """
+    ymin, xmin, ymax, xmax = vlm_box
+
+    # Scale from 0-1000 range to actual pixels
+    x_px = int(round((xmin / 1000.0) * image_width))
+    y_px = int(round((ymin / 1000.0) * image_height))
+    x_max_px = int(round((xmax / 1000.0) * image_width))
+    y_max_px = int(round((ymax / 1000.0) * image_height))
+
+    # Convert from min/max to x/y/width/height
+    width = max(x_max_px - x_px, 1)
+    height = max(y_max_px - y_px, 1)
+
+    return (x_px, y_px, width, height)
+
+
+def calculate_region_offset(region: str, capture_config: CaptureConfig, full_width: int) -> Tuple[int, int]:
+    """Calculate the offset of a cropped region within the full client area.
+
+    Args:
+        region: Either "primary" or "menus"
+        capture_config: Capture configuration with split ratios
+        full_width: Full client width in logical pixels
+
+    Returns:
+        (x_offset, y_offset) in logical pixels
+    """
+    if not capture_config.split.enabled:
+        return (0, 0)
+
+    split = capture_config.split
+    left_pin_end = int(round(full_width * split.left_pin_ratio))
+    primary_end = int(round(full_width * (split.left_pin_ratio + split.primary_ratio)))
+
+    if region == "primary":
+        return (left_pin_end, 0)
+    elif region == "menus":
+        return (primary_end, 0)
+    else:
+        return (0, 0)
 
 
 class CoordinatorError(RuntimeError):
@@ -55,6 +111,7 @@ class GameLoopCoordinator:
         """
         self._logger = logger or logging.getLogger(__name__)
         self._agent_config = agent_config
+        self._capture_config = capture_config
         self._should_stop = False
         self._turn_counter = 0
 
@@ -251,12 +308,29 @@ class GameLoopCoordinator:
             # Button detection in menus
             if menu_state.is_usable:
                 menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                # Images are in physical pixels, convert to logical for coordinate system
+                menus_width_physical, menus_height_physical = capture_result.menus_image.size
+                scaling_factor = capture_result.geometry.client_area.scaling_factor
+                menus_width_logical = int(round(menus_width_physical / scaling_factor))
+                menus_height_logical = int(round(menus_height_physical / scaling_factor))
+
+                full_width = capture_result.geometry.client_area.width_logical
+                offset_x, offset_y = calculate_region_offset("menus", self._capture_config, full_width)
+
                 for btn_raw in menu_buttons_raw:
                     name, metadata = parse_button_label(btn_raw["label"])
+                    # Convert VLM box [ymin, xmin, ymax, xmax] (0-1000) to logical pixel bounds
+                    x, y, w, h = convert_vlm_box_to_pixels(
+                        btn_raw["box_2d"],
+                        menus_width_logical,
+                        menus_height_logical
+                    )
+                    # Apply region offset to convert to full client coordinates
+                    bounds = (x + offset_x, y + offset_y, w, h)
                     buttons.append({
                         "name": name,
                         "full_label": btn_raw["label"],
-                        "bounds": btn_raw["box_2d"],
+                        "bounds": bounds,
                         "metadata": metadata,
                         "region": "menus",
                     })
@@ -265,12 +339,29 @@ class GameLoopCoordinator:
         if capture_result.primary_path and capture_result.primary_path.exists():
             # Button detection
             primary_buttons_raw = self._vision.get_primary_elements(str(capture_result.primary_path))
+            # Images are in physical pixels, convert to logical for coordinate system
+            primary_width_physical, primary_height_physical = capture_result.primary_image.size
+            scaling_factor = capture_result.geometry.client_area.scaling_factor
+            primary_width_logical = int(round(primary_width_physical / scaling_factor))
+            primary_height_logical = int(round(primary_height_physical / scaling_factor))
+
+            full_width = capture_result.geometry.client_area.width_logical
+            offset_x, offset_y = calculate_region_offset("primary", self._capture_config, full_width)
+
             for btn_raw in primary_buttons_raw:
                 name, metadata = parse_button_label(btn_raw["label"])
+                # Convert VLM box [ymin, xmin, ymax, xmax] (0-1000) to logical pixel bounds
+                x, y, w, h = convert_vlm_box_to_pixels(
+                    btn_raw["box_2d"],
+                    primary_width_logical,
+                    primary_height_logical
+                )
+                # Apply region offset to convert to full client coordinates
+                bounds = (x + offset_x, y + offset_y, w, h)
                 buttons.append({
                     "name": name,
                     "full_label": btn_raw["label"],
-                    "bounds": btn_raw["box_2d"],
+                    "bounds": bounds,
                     "metadata": metadata,
                     "region": "primary",
                 })
