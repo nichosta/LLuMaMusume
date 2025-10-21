@@ -6,6 +6,7 @@ logs
 .pytest_cache
 .claude
 wsl2
+testing_archive
 
 # Debug and temporary files (kept for reference but not tracked)
 debug_temp/
