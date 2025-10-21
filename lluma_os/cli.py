@@ -7,9 +7,19 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from .capture import CaptureError, CaptureManager
-from .config import load_configs
-from .window import UmaWindow
+try:
+    from .capture import CaptureError, CaptureManager
+    from .config import load_configs
+    from .window import UmaWindow
+except ImportError:
+    # Allow direct execution (python lluma_os/cli.py) by resolving the package root
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).resolve().parent.parent))
+    from lluma_os.capture import CaptureError, CaptureManager
+    from lluma_os.config import load_configs
+    from lluma_os.window import UmaWindow
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,7 +63,13 @@ def main(argv: list[str] | None = None) -> int:
         logging.error("Capture failed: %s", exc)
         return 1
 
-    logging.info("Capture stored at %s (primary=%s, menus=%s)", result.raw_path, result.primary_path, result.menus_path)
+    logging.info(
+        "Capture stored at %s (primary=%s, menus=%s, tabs=%s)",
+        result.raw_path,
+        result.primary_path,
+        result.menus_path,
+        result.tabs_path,
+    )
     logging.info(
         "Mean luminance %.2f / std %.2f across %dx%d",
         result.validation.mean_luminance,

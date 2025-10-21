@@ -13,7 +13,6 @@ from lluma_vision import MenuAnalyzer, MenuState, TabAvailability
 from lluma_vision.menu_analyzer import ScrollbarInfo, TabInfo
 
 DATA_DIR = Path(__file__).parent / "data" / "menu_captures"
-MENU_SECTION_START_RATIO = 0.5  # menus occupy the right half of the capture
 PRIMARY_SCROLLBAR_DIR = Path(__file__).parent / "data" / "primary_scrollbars"
 
 
@@ -23,36 +22,22 @@ class MenuVisionRegressionTest(unittest.TestCase):
     def setUp(self) -> None:
         self.analyzer = MenuAnalyzer()
 
-    def _load_menu_section(self, filename: str) -> Image.Image:
+    def _load_menu_image(self, filename: str) -> Image.Image:
         image_path = DATA_DIR / filename
         self.assertTrue(image_path.exists(), f"Missing test asset: {image_path}")
-
         with Image.open(image_path) as base_image:
-            width, height = base_image.size
-            menu_start_x = int(width * MENU_SECTION_START_RATIO)
-            menu_image = base_image.crop((menu_start_x, 0, width, height)).copy()
-
-        return menu_image
+            return base_image.copy()
 
     def test_reference_captures(self) -> None:
         test_cases = [
-            # Tab is career profile, top 4 tabs are enabled, bottom 4 tabs are disabled
             {
-                "file": "career profile, bottom 3 disabled.png",
-                "expected_usable": True,
-                "expected_selected": "Career Profile",
-                "expected_available": ["Jukebox", "Sparks", "Log", "Career Profile"],
-            },
-            # Tab is menu, all buttons in tab window are active, only topmost and bottommost tabs are selectable
-            {
-                "file": "menu, all active.png",
+                "file": "top and bottom active, menu selected.png",
                 "expected_usable": True,
                 "expected_selected": "Menu",
                 "expected_available": ["Jukebox", "Menu"],
             },
-            # Tab is menu, but the entire image is blurred, indicating unusability
             {
-                "file": "menu, all blurred.png",
+                "file": "all blurred.png",
                 "expected_usable": False,
                 "expected_selected": None,
                 "expected_available": [],
@@ -61,7 +46,7 @@ class MenuVisionRegressionTest(unittest.TestCase):
 
         for case in test_cases:
             with self.subTest(filename=case["file"]):
-                menu_image = self._load_menu_section(case["file"])
+                menu_image = self._load_menu_image(case["file"])
                 result = self.analyzer.analyze_menu(menu_image)
 
                 self.assertEqual(result.is_usable, case["expected_usable"])

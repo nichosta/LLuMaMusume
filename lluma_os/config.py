@@ -41,13 +41,19 @@ class SplitConfig:
     """Controls optional primary/menus image splitting."""
 
     enabled: bool = True
-    left_pin_ratio: float = 0.1  # proportion of width for left pin (discarded)
-    primary_ratio: float = 0.4  # proportion of width assigned to primary view
-    menus_ratio: float = 0.5    # proportion of width assigned to menus view
+    left_pin_ratio: float = 0.1   # proportion of width for left pin (discarded)
+    primary_ratio: float = 0.4    # proportion of width assigned to primary view
+    menus_ratio: float = 0.4      # proportion of width assigned to menus view
+    tabs_ratio: float = 0.1       # proportion of width assigned to right-side tabs
     
     def __post_init__(self) -> None:
         """Validate that ratios sum to 1.0."""
-        total = self.left_pin_ratio + self.primary_ratio + self.menus_ratio
+        total = (
+            self.left_pin_ratio
+            + self.primary_ratio
+            + self.menus_ratio
+            + self.tabs_ratio
+        )
         if abs(total - 1.0) > 1e-6:
             raise ValueError(f"Split ratios must sum to 1.0, got {total:.6f}")
 
@@ -79,15 +85,30 @@ class CaptureConfig:
     scaling_factor: float = 1.5
 
 
-def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig]:
-    """Load window and capture configuration from YAML, falling back to defaults."""
+@dataclass(slots=True)
+class AgentConfig:
+    """Agent and LLM configuration."""
+
+    model: str = "anthropic/claude-haiku-4.5"
+    memory_dir: Path = Path("memory")
+    logs_dir: Path = Path("logs")
+    max_memory_tokens: int = 32000
+    max_context_tokens: int = 32000
+    request_timeout_s: int = 30
+    turn_post_padding_s: float = 5.0
+    allow_skip_cinematics: bool = False
+
+
+def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
+    """Load window, capture, and agent configuration from YAML, falling back to defaults."""
 
     cfg_path = path or Path("config.yaml")
     window_cfg = WindowConfig()
     capture_cfg = CaptureConfig()
+    agent_cfg = AgentConfig()
 
     if not cfg_path.exists():
-        return window_cfg, capture_cfg
+        return window_cfg, capture_cfg, agent_cfg
 
     with cfg_path.open("r", encoding="utf-8") as handle:
         raw = yaml.safe_load(handle) or {}
@@ -101,7 +122,10 @@ def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConf
     if capture_scaling_override is None:
         capture_cfg.scaling_factor = window_cfg.scaling_factor
 
-    return window_cfg, capture_cfg
+    agent_data = raw.get("agent", {})
+    _apply_agent_config(agent_cfg, agent_data)
+
+    return window_cfg, capture_cfg, agent_cfg
 
 
 def _apply_window_config(config: WindowConfig, data: Dict) -> None:
@@ -158,6 +182,8 @@ def _apply_capture_config(config: CaptureConfig, data: Dict) -> None:
             config.split.primary_ratio = float(split_data["primary_ratio"])
         if "menus_ratio" in split_data:
             config.split.menus_ratio = float(split_data["menus_ratio"])
+        if "tabs_ratio" in split_data:
+            config.split.tabs_ratio = float(split_data["tabs_ratio"])
             
         # Legacy support for old ratios structure
         ratios = split_data.get("ratios")
@@ -165,12 +191,15 @@ def _apply_capture_config(config: CaptureConfig, data: Dict) -> None:
             left_pin = ratios.get("left_pin")
             primary = ratios.get("primary")
             menus = ratios.get("menus")
+            tabs = ratios.get("tabs")
             if left_pin is not None:
                 config.split.left_pin_ratio = float(left_pin)
             if primary is not None:
                 config.split.primary_ratio = float(primary)
             if menus is not None:
                 config.split.menus_ratio = float(menus)
+            if tabs is not None:
+                config.split.tabs_ratio = float(tabs)
 
     validation_data = data.get("validation") or {}
     if validation_data:
@@ -184,6 +213,35 @@ def _apply_capture_config(config: CaptureConfig, data: Dict) -> None:
         config.retention.max_captures = int(retention_data["max_captures"])
 
 
+def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
+    if not data:
+        return
+
+    if "model" in data:
+        config.model = str(data["model"])
+
+    if "memory_dir" in data:
+        config.memory_dir = Path(str(data["memory_dir"]))
+
+    if "logs_dir" in data:
+        config.logs_dir = Path(str(data["logs_dir"]))
+
+    if "max_memory_tokens" in data:
+        config.max_memory_tokens = int(data["max_memory_tokens"])
+
+    if "max_context_tokens" in data:
+        config.max_context_tokens = int(data["max_context_tokens"])
+
+    if "request_timeout_s" in data:
+        config.request_timeout_s = int(data["request_timeout_s"])
+
+    if "turn_post_padding_s" in data:
+        config.turn_post_padding_s = float(data["turn_post_padding_s"])
+
+    if "allow_skip_cinematics" in data:
+        config.allow_skip_cinematics = bool(data["allow_skip_cinematics"])
+
+
 __all__ = [
     "WindowPlacement",
     "WindowConfig",
@@ -191,5 +249,6 @@ __all__ = [
     "CaptureValidationConfig",
     "RetentionConfig",
     "CaptureConfig",
+    "AgentConfig",
     "load_configs",
 ]

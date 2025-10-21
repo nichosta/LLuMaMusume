@@ -80,8 +80,8 @@ Capture specifics
 - Region: Compute client-area rect (logical px), transform to screen px using the `scaling_factor` (150%), and pass to MSS as the crop box.
 - Validation: Verify capture size matches expected client-area size; sample a small pixel grid to ensure the image is non-black/non-uniform. If invalid, retry once after refocusing; otherwise skip the turn with a diagnostic.
 - Format: Save raw PNG (lossless) for Vision. Optionally save a JPEG preview for logs.
-- Splitting: Produce `Primary` and `Menus` crops from the raw capture. Split uses three ratios that sum to 1.0: `left_pin_ratio` (discarded left strip), `primary_ratio` (gameplay area), and `menus_ratio` (UI area). All ratios are percentages of total client width.
-- Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png` and `captures/<turn_id>-menus.png` when split is enabled.
+- Splitting: Produce `Primary`, `Menus`, and `Tabs` crops from the raw capture. Split uses four ratios that sum to 1.0: `left_pin_ratio` (discarded left strip), `primary_ratio` (gameplay area), `menus_ratio` (menu content), and `tabs_ratio` (right-side tab column). All ratios are percentages of total client width.
+- Filenames: `captures/<turn_id>.png`, plus `captures/<turn_id>-primary.png`, `captures/<turn_id>-menus.png`, and `captures/<turn_id>-tabs.png` when split is enabled.
 - Retention: Keep the last N turns (configurable, e.g., 200) and clean older files on startup.
 - Occlusion: We rely on focus + top-level z-order; per-window capture is not used. If occluded content is suspected (e.g., unexpected uniform regions), abort the turn.
 - Primary crop: feed to the VLM to enumerate main-area buttons. Scrollbar state is derived from local heuristics that examine the rightmost ~220 px band for the mauve/grey track and thumb (see `lluma_vision/menu_analyzer.py::detect_primary_scrollbar()` for implementation details).
@@ -99,12 +99,13 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
 ## Vision I/O
 
 - Inputs
-  - Images: full client-area PNG plus derived crops `Primary` and `Menus`.
-  - Optional masking: exclude the left-side pin strip region from detection (configured via `split.left_pin_ratio`).
+  - Images: full client-area PNG plus derived crops `Primary`, `Menus`, and `Tabs`.
+- Optional masking: exclude the left-side pin strip region from detection (configured via `split.left_pin_ratio`) and the right-side tabs (via `split.tabs_ratio`).
   - Normalization: apply light denoise and brightness/contrast normalization to stabilize detection; do not alter geometry.
 
 - VLM detection mode
   - Use object detection that returns `box_2d: [ymin, xmin, ymax, xmax]` and `label: string` with coordinates normalized to 0–1000 relative to the input image.
+  - REPEATING AGAIN BECAUSE IT'S IMPORTANT: THE OUTPUTS OF THE VLM ARE IN Y, X FORMAT. SWITCH THEM IMMEDIATELY AFTER RECIEVING THEM IF USING X, Y.
   - No native confidence provided; when feasible, request that the model appends an approximate confidence to the `label` (see label encoding). Treat it as advisory only.
 
 - Label encoding (single string parsed by the harness)
@@ -116,7 +117,7 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
   - `buttons`: list of { `name`, `bounds` (client logical px: x,y,w,h), optional `section`/`hint` }.
   - `hotspots`: named regions like `dialogue_center`, `confirm_ok`, etc., same bounds convention.
   - `overlays`: detected UI states such as `tutorial_overlay`, `modal_dialog`, `loading_mask`.
-  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus` }, `left_pin_ratio` }.
+  - `meta`: { `turn_id`, `client_size`, `scaling_factor`, `splits`: { `primary`, `menus`, `tabs` }, `left_pin_ratio`, `tabs_ratio` }.
 
 - Coordinate conversion
   - The VLM provides normalized coords per input image (full or crop). Convert to client-relative logical pixels for use by the agent/OS handler.
@@ -272,7 +273,8 @@ Centralized configuration defines environment- and game-specific parameters. Use
   - `capture.retention`: 200 (number of turns to keep)
   - `split.left_pin_ratio`: 0.07874 (proportion of width for left pin strip, discarded)
   - `split.primary_ratio`: 0.42126 (proportion of width for primary gameplay area)
-  - `split.menus_ratio`: 0.50 (proportion of width for menus/UI area)
+  - `split.menus_ratio`: 0.42126 (proportion of width for menus/UI area)
+  - `split.tabs_ratio`: 0.07874 (proportion of width for tabs column)
   - `vision.parallel_calls`: true (allow per-crop prompts concurrently)
 
 - Input behavior

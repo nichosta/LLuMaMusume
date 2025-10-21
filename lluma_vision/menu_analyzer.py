@@ -9,14 +9,11 @@ from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
+import requests
 from numpy.lib.stride_tricks import sliding_window_view
-try:  # pragma: no cover - optional dependency
-    from openai import OpenAI
-except ImportError:  # pragma: no cover - optional dependency
-    OpenAI = None  # type: ignore[assignment]
 from PIL import Image
 
 Logger = logging.Logger
@@ -89,13 +86,22 @@ class MenuAnalyzer:
 
     def __init__(self, logger: Optional[Logger] = None) -> None:
         self._logger = logger or logging.getLogger(__name__)
-        self._openrouter_client: Any = None
+        self._api_key: Optional[str] = None
+        self._headers: Optional[Dict[str, str]] = None
 
-    def analyze_menu(self, menu_image: Image.Image) -> MenuState:
-        """Analyze a menu section image and return the menu state."""
-        
+    def analyze_menu(self, menu_image: Image.Image, tabs_image: Optional[Image.Image] = None) -> MenuState:
+        """Analyze a menu section image and return the menu state.
+
+        Args:
+            menu_image: Cropped menu content pane (without left pin or tabs).
+            tabs_image: Optional crop that isolates the vertical tab list.
+        """
+
         # Step 1: Check if menu is usable (not blurred)
         is_usable = self._detect_usability(menu_image)
+        tab_reference = tabs_image or menu_image
+        if tab_reference is None:
+            tab_reference = menu_image
         
         if not is_usable:
             # If blurred, we can't reliably detect tab states
@@ -106,10 +112,10 @@ class MenuAnalyzer:
             )
         
         # Step 2: Detect selected tab (green highlight)
-        selected_tab = self._detect_selected_tab(menu_image)
+        selected_tab = self._detect_selected_tab(tab_reference)
         
         # Step 3: Detect available tabs (white vs gray boxes)
-        tab_availabilities = self._detect_tab_availability(menu_image)
+        tab_availabilities = self._detect_tab_availability(tab_reference)
         
         # Build tab info list
         tabs = []
@@ -219,8 +225,7 @@ class MenuAnalyzer:
         img_array = np.asarray(image)
         height, width = img_array.shape[:2]
         
-        # For availability detection, focus on the button backing near the right edge.
-        # The active/inactive fill sits in the last ~15% of the menu pane (mirrors left_pin ratio overall).
+        # Focus on the right edge backing where the active/inactive fill resides.
         tab_width = max(int(width * 0.15), 1)
         tab_region_start = max(width - tab_width, 0)
         tab_region_end = width
@@ -270,7 +275,7 @@ class MenuAnalyzer:
         # Available tabs: rgb_balance > 0.040 OR brightness > 230
         # Unavailable tabs: rgb_balance <= 0.040 AND brightness <= 230
         balance_threshold = 0.075
-        brightness_threshold = 230.0
+        brightness_threshold = 225.0
         
         if rgb_balance > balance_threshold or brightness > brightness_threshold:
             if brightness > brightness_threshold:
@@ -278,7 +283,7 @@ class MenuAnalyzer:
                 region_gray = np.dot(region[..., :3], [0.299, 0.587, 0.114])
                 gy, gx = np.gradient(region_gray)
                 edge_strength = float(np.mean(np.sqrt(gx * gx + gy * gy)))
-                edge_threshold = 0.3
+                edge_threshold = 0.04
 
                 if edge_strength < edge_threshold:
                     return TabAvailability.UNAVAILABLE
@@ -302,7 +307,7 @@ class MenuAnalyzer:
         if not image_file.exists():
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
-        client = self._get_openrouter_client()
+        self._ensure_api_configured()
 
         base64_image = self._prepare_api_image(image_file, trim_left_ratio=self.LEFT_TRIM_RATIO)
 
@@ -334,19 +339,29 @@ class MenuAnalyzer:
         }
 
         try:
-            response = client.chat.completions.create(
-                model="google/gemini-flash-2.5-latest",
-                messages=[
+            request_body = {
+                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     payload,
                 ],
-                response_format={"type": "json_object"},
+                "response_format": {"type": "json_object"},
+                "reasoning": {"enabled": False},  # No reasoning is recommended by Google
+            }
+
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=self._headers,
+                json=request_body,
+                timeout=60,
             )
+            response.raise_for_status()
+            response_data = response.json()
         except Exception as exc:  # pragma: no cover - network failure path
             self._logger.error("Error querying OpenRouter: %s", exc)
             return []
 
-        content = self._extract_response_content(response)
+        content = self._extract_response_content(response_data)
         if content is None:
             return []
 
@@ -359,7 +374,7 @@ class MenuAnalyzer:
         if not image_file.exists():
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
-        client = self._get_openrouter_client()
+        self._ensure_api_configured()
         base64_image = self._prepare_api_image(image_file, trim_left_ratio=0.0)
 
         system_prompt = (
@@ -388,19 +403,29 @@ class MenuAnalyzer:
         }
 
         try:
-            response = client.chat.completions.create(
-                model="google/gemini-flash-2.5-latest",
-                messages=[
+            request_body = {
+                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "messages": [
                     {"role": "system", "content": system_prompt},
                     payload,
                 ],
-                response_format={"type": "json_object"},
+                "response_format": {"type": "json_object"},
+                "reasoning": {"enabled": False},  # No reasoning is recommended by Google
+            }
+
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=self._headers,
+                json=request_body,
+                timeout=60,
             )
+            response.raise_for_status()
+            response_data = response.json()
         except Exception as exc:  # pragma: no cover - network failure path
             self._logger.error("Error querying OpenRouter: %s", exc)
             return []
 
-        content = self._extract_response_content(response)
+        content = self._extract_response_content(response_data)
         if content is None:
             return []
 
@@ -556,40 +581,33 @@ class MenuAnalyzer:
 
         return best
 
-    def _get_openrouter_client(self) -> Any:
-        """Initialise a cached OpenRouter client."""
+    def _ensure_api_configured(self) -> None:
+        """Ensure OpenRouter API configuration is initialized."""
 
-        if self._openrouter_client is not None:
-            return self._openrouter_client
-
-        if OpenAI is None:
-            raise ImportError(
-                "openai package is required for OpenRouter integration. Install it via `pip install openai`."
-            )
+        if self._headers is not None:
+            return
 
         api_key = os.environ.get("OPENROUTER_API_KEY")
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY environment variable not set.")
 
-        self._openrouter_client = OpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            api_key=api_key,
-            default_headers={
-                "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
-                "X-Title": "LLuMa Musume Agent",
-            },
-        )
-        return self._openrouter_client
+        self._api_key = api_key
+        self._headers = {
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+            "X-Title": "LLuMa Musume Agent",
+            "Content-Type": "application/json",
+        }
 
-    def _extract_response_content(self, response: Any) -> Optional[str]:
-        """Safely pull the content string from an OpenRouter response object."""
+    def _extract_response_content(self, response: Dict[str, Any]) -> Optional[str]:
+        """Safely pull the content string from an OpenRouter response dict."""
 
         try:
-            choices = getattr(response, "choices", None)
+            choices = response.get("choices")
             if not choices:
                 return None
-            message = choices[0].message
-            content = getattr(message, "content", None)
+            message = choices[0]["message"]
+            content = message.get("content")
             if not content:
                 return None
             return str(content).strip()

@@ -12,4 +12,5 @@ capture:
   split:
     left_pin_ratio: 0.07874    # Left pin area (discarded)
     primary_ratio: 0.42126     # Primary gameplay area
-    menus_ratio: 0.50          # Menu/UI area
+    menus_ratio: 0.41497       # Menu/UI area
+    tabs_ratio: 0.08503        # Right-side tabs (clipped to separate image)

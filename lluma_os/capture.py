@@ -49,6 +49,8 @@ class CaptureResult:
     primary_path: Optional[Path] = None
     menus_image: Optional[Image.Image] = None
     menus_path: Optional[Path] = None
+    tabs_image: Optional[Image.Image] = None
+    tabs_path: Optional[Path] = None
 
 
 class CaptureError(RuntimeError):
@@ -82,14 +84,23 @@ class CaptureManager:
         primary_path: Optional[Path]
         menus_image: Optional[Image.Image]
         menus_path: Optional[Path]
-        primary_image = primary_path = menus_image = menus_path = None
+        tabs_image: Optional[Image.Image]
+        tabs_path: Optional[Path]
+        (
+            primary_image,
+            menus_image,
+            tabs_image,
+        ) = (None, None, None)
+        primary_path = menus_path = tabs_path = None
 
         if self._config.split.enabled:
-            primary_image, menus_image = self._split_capture(raw_image, geometry.client_area)
+            primary_image, menus_image, tabs_image = self._split_capture(raw_image, geometry.client_area)
             if primary_image is not None:
                 primary_path = self._save(primary_image, f"{turn_id}-primary")
             if menus_image is not None:
                 menus_path = self._save(menus_image, f"{turn_id}-menus")
+            if tabs_image is not None:
+                tabs_path = self._save(tabs_image, f"{turn_id}-tabs")
 
         self._enforce_retention()
 
@@ -103,6 +114,8 @@ class CaptureManager:
             primary_path=primary_path,
             menus_image=menus_image,
             menus_path=menus_path,
+            tabs_image=tabs_image,
+            tabs_path=tabs_path,
         )
 
     def _build_bbox(self, client_area: ClientArea) -> dict:
@@ -144,29 +157,41 @@ class CaptureManager:
 
     def _split_capture(
         self, image: Image.Image, client_area: ClientArea
-    ) -> Tuple[Optional[Image.Image], Optional[Image.Image]]:
+    ) -> Tuple[Optional[Image.Image], Optional[Image.Image], Optional[Image.Image]]:
         split_cfg = self._config.split
         if not split_cfg.enabled:
-            return None, None
+            return None, None, None
 
         width, height = image.size
         
         # Calculate section boundaries using simple ratios
         left_pin_end = int(round(width * split_cfg.left_pin_ratio))
         primary_end = int(round(width * (split_cfg.left_pin_ratio + split_cfg.primary_ratio)))
-        # menus goes to end of image (width * 1.0)
+        menus_end = int(
+            round(
+                width
+                * (
+                    split_cfg.left_pin_ratio
+                    + split_cfg.primary_ratio
+                    + split_cfg.menus_ratio
+                )
+            )
+        )
         
         # Ensure boundaries are valid
         left_pin_end = max(0, min(left_pin_end, width))
         primary_end = max(left_pin_end, min(primary_end, width))
+        menus_end = max(primary_end, min(menus_end, width))
         
         # Crop the sections (discard left pin, keep primary and menus)
         primary_box = (left_pin_end, 0, primary_end, height)
-        menus_box = (primary_end, 0, width, height)
+        menus_box = (primary_end, 0, menus_end, height)
+        tabs_box = (menus_end, 0, width, height)
 
         primary_image = image.crop(primary_box) if primary_box[2] > primary_box[0] else None
         menus_image = image.crop(menus_box) if menus_box[2] > menus_box[0] else None
-        return primary_image, menus_image
+        tabs_image = image.crop(tabs_box) if tabs_box[2] > tabs_box[0] else None
+        return primary_image, menus_image, tabs_image
 
     def _save(self, image: Image.Image, stem: str) -> Path:
         safe_stem = re.sub(r"[^A-Za-z0-9._-]", "_", stem)
@@ -180,8 +205,9 @@ class CaptureManager:
         if max_captures <= 0:
             return
 
+        excluded_suffixes = ("-primary.png", "-menus.png", "-tabs.png")
         raw_files = sorted(
-            [p for p in self._output_dir.glob("*.png") if not p.name.endswith(("-primary.png", "-menus.png"))],
+            [p for p in self._output_dir.glob("*.png") if not p.name.endswith(excluded_suffixes)],
             key=lambda p: p.stat().st_mtime,
         )
         excess = len(raw_files) - max_captures
@@ -192,6 +218,6 @@ class CaptureManager:
         self._logger.debug("Deleting capture set rooted at %s", raw_file)
         raw_file.unlink(missing_ok=True)
         stem = raw_file.stem
-        for suffix in ("-primary.png", "-menus.png"):
+        for suffix in ("-primary.png", "-menus.png", "-tabs.png"):
             candidate = raw_file.with_name(f"{stem}{suffix}")
             candidate.unlink(missing_ok=True)
