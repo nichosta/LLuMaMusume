@@ -105,6 +105,7 @@ The raw screenshot (most likely only the Primary side) is also handed to the age
 
 - VLM detection mode
   - Use object detection that returns `box_2d: [ymin, xmin, ymax, xmax]` and `label: string` with coordinates normalized to 0–1000 relative to the input image.
+  - REPEATING AGAIN BECAUSE IT'S IMPORTANT: THE OUTPUTS OF THE VLM ARE IN Y, X FORMAT. SWITCH THEM IMMEDIATELY AFTER RECIEVING THEM IF USING X, Y.
   - No native confidence provided; when feasible, request that the model appends an approximate confidence to the `label` (see label encoding). Treat it as advisory only.
 
 - Label encoding (single string parsed by the harness)
