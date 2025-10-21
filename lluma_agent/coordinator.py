@@ -24,7 +24,6 @@ from lluma_os.input_handler import (
 )
 from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
 from lluma_vision.menu_analyzer import MenuAnalyzer
-from PIL import Image
 
 from .agent import AgentError, UmaAgent, VisionData
 from .memory import MemoryManager
@@ -85,6 +84,32 @@ def calculate_region_offset(region: str, capture_config: CaptureConfig, full_wid
         return (primary_end, 0)
     else:
         return (0, 0)
+
+
+def calculate_primary_center(capture_result: Any, capture_config: CaptureConfig) -> Tuple[int, int]:
+    """Determine the logical center of the primary region for dialogue clicks."""
+
+    client_area = capture_result.geometry.client_area
+    if capture_result.primary_image is None:
+        return (
+            client_area.width_logical // 2,
+            client_area.height_logical // 2,
+        )
+
+    scale = client_area.scaling_factor
+    primary_width_physical, primary_height_physical = capture_result.primary_image.size
+    primary_width_logical = max(int(round(primary_width_physical / scale)), 1)
+    primary_height_logical = max(int(round(primary_height_physical / scale)), 1)
+
+    offset_x, offset_y = calculate_region_offset(
+        "primary",
+        capture_config,
+        client_area.width_logical,
+    )
+
+    center_x = offset_x + primary_width_logical // 2
+    center_y = offset_y + primary_height_logical // 2
+    return (center_x, center_y)
 
 
 class CoordinatorError(RuntimeError):
@@ -426,11 +451,7 @@ class GameLoopCoordinator:
             )
 
         # Primary center (use center of primary image)
-        if capture_result.primary_image:
-            w, h = capture_result.primary_image.size
-            primary_center = (w // 2, h // 2)
-        else:
-            primary_center = (500, 500)  # Fallback
+        primary_center = calculate_primary_center(capture_result, self._capture_config)
 
         vision_output = VisionOutput(
             buttons=button_infos,
