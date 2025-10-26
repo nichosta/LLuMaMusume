@@ -340,7 +340,7 @@ class MenuAnalyzer:
 
         try:
             request_body = {
-                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "model": "google/gemini-2.5-flash-lite-preview-09-2025",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     payload,
@@ -404,7 +404,7 @@ class MenuAnalyzer:
 
         try:
             request_body = {
-                "model": "google/gemini-2.5-flash-preview-09-2025",
+                "model": "google/gemini-2.5-flash-lite-preview-09-2025",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     payload,

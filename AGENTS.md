@@ -135,7 +135,7 @@ Empty/low-signal frames
 
 ### VLM Prompts
 
-The Vision pipeline uses `google/gemini-2.5-flash-preview-09-2025` on OpenRouter for both menu and primary detections. Two prompts are issued:
+The Vision pipeline uses `google/gemini-2.5-flash-lite-preview-09-2025` on OpenRouter for both menu and primary detections. Two prompts are issued:
 
 **Menu Region Detection** (used by `get_clickable_buttons()`):
 - System: "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) to find interactive buttons. Respond with JSON listing each distinct clickable button once. Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags. IMPORTANT: If two buttons would have the same name, add a distinguishing identifier to the name itself (not just in metadata tags) so each button name is unique."
@@ -167,7 +167,7 @@ Optional packages (`opencv-python-headless`, `scikit-image`, `ImageHash`, `pytes
 
 # Agent
 
-The reasoning agent lives in `lluma_agent`. It currently calls OpenRouter’s `anthropic/claude-haiku-4.5` model (configurable via `agent.model`). Vision continues to use Gemini 2.5 Flash; the agent model can be changed independently in `config.yaml`.
+The reasoning agent lives in `lluma_agent`. It currently calls OpenRouter’s `anthropic/claude-haiku-4.5` model (configurable via `agent.model`). Vision continues to use Gemini 2.5 Flash-Lite; the agent model can be changed independently in `config.yaml`.
 
 ## Tools
 
