@@ -50,7 +50,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="[%(levelname)s] %(message)s")
 
-    window_cfg, capture_cfg = load_configs(args.config)
+    window_cfg, capture_cfg, agent_config = load_configs(args.config)
     capture_cfg.scaling_factor = window_cfg.scaling_factor
 
     uma_window = UmaWindow(window_cfg)

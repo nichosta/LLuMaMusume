@@ -332,12 +332,15 @@ class GameLoopCoordinator:
 
             # Button detection in menus
             if menu_state.is_usable:
-                menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                menu_buttons_raw, trim_ratio = self._vision.get_clickable_buttons(str(capture_result.menus_path))
                 # Images are in physical pixels, convert to logical for coordinate system
                 menus_width_physical, menus_height_physical = capture_result.menus_image.size
                 scaling_factor = capture_result.geometry.client_area.scaling_factor
                 menus_width_logical = int(round(menus_width_physical / scaling_factor))
                 menus_height_logical = int(round(menus_height_physical / scaling_factor))
+
+                trim_offset_logical = int(round(menus_width_logical * trim_ratio))
+                trimmed_width_logical = max(menus_width_logical - trim_offset_logical, 1)
 
                 full_width = capture_result.geometry.client_area.width_logical
                 offset_x, offset_y = calculate_region_offset("menus", self._capture_config, full_width)
@@ -347,11 +350,11 @@ class GameLoopCoordinator:
                     # Convert VLM box [ymin, xmin, ymax, xmax] (0-1000) to logical pixel bounds
                     x, y, w, h = convert_vlm_box_to_pixels(
                         btn_raw["box_2d"],
-                        menus_width_logical,
+                        trimmed_width_logical,
                         menus_height_logical
                     )
                     # Apply region offset to convert to full client coordinates
-                    bounds = (x + offset_x, y + offset_y, w, h)
+                    bounds = (x + offset_x + trim_offset_logical, y + offset_y, w, h)
                     buttons.append({
                         "name": name,
                         "full_label": btn_raw["label"],

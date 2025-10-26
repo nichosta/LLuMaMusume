@@ -132,6 +132,7 @@ class UmaAgent:
                 "tool_choice": "auto",
             }
 
+            self._logger.info("Calling OpenRouter agent model %s for turn %s", self._model, turn_id)
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=self._headers,
@@ -344,13 +345,24 @@ class UmaAgent:
             for tc in tool_calls:
                 function = tc["function"]
                 name = function["name"]
-                args_str = function["arguments"]
+                raw_arguments = function.get("arguments", "")
 
-                # Parse arguments JSON
-                try:
-                    arguments = json.loads(args_str)
-                except json.JSONDecodeError:
-                    self._logger.warning("Failed to parse tool arguments for %s: %s", name, args_str)
+                if raw_arguments is None:
+                    arguments = {}
+                elif isinstance(raw_arguments, str):
+                    args_str = raw_arguments.strip()
+                    if args_str:
+                        try:
+                            arguments = json.loads(args_str)
+                        except json.JSONDecodeError:
+                            self._logger.warning("Failed to parse tool arguments for %s: %s", name, args_str)
+                            arguments = {}
+                    else:
+                        arguments = {}
+                elif isinstance(raw_arguments, dict):
+                    arguments = raw_arguments
+                else:
+                    self._logger.warning("Unexpected arguments payload for %s: %r", name, raw_arguments)
                     arguments = {}
 
                 calls.append({"name": name, "arguments": arguments})
