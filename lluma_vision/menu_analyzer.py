@@ -74,7 +74,7 @@ class MenuAnalyzer:
     PRIMARY_SCROLLBAR_BAND_WIDTH = 220  # width of primary-image band used for scrollbar detection
     SCROLLBAR_MIN_WIDTH = 8
     SCROLLBAR_MAX_WIDTH = 16
-    SCROLLBAR_SEARCH_WIDTH = 160  # search only within this many pixels of the right edge
+    SCROLLBAR_SEARCH_WIDTH = 200  # restrict detection to this many pixels from the right edge
     SCROLLBAR_MIN_EDGE_STRENGTH = 5.0
     SCROLLBAR_SMOOTH_KERNEL = 9
     SCROLLBAR_THUMB_DELTA = 28.0
@@ -567,7 +567,8 @@ class MenuAnalyzer:
                     continue
 
                 global_left = width - band_width + left_edge
-                if global_left < width - self.SCROLLBAR_SEARCH_WIDTH:
+                search_width = min(self.SCROLLBAR_SEARCH_WIDTH, band_width)
+                if global_left < width - search_width:
                     continue
 
                 edge_strength = float(mean_grad[left_edge] + mean_grad[right_edge - 1])

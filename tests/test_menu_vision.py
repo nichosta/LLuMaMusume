@@ -132,12 +132,12 @@ class MenuVisionRegressionTest(unittest.TestCase):
         """Validate scrollbar heuristics against reference captures."""
 
         # No scrollbar present
-        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-161528-primary.png") as image:
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "missions_no_scrollbar.png") as image:
             result = self.analyzer.detect_primary_scrollbar(image)
         self.assertIsNone(result)
 
         # Scrollbar near the bottom with travel remaining in both directions
-        with Image.open(PRIMARY_SCROLLBAR_DIR / "20251011-184452-primary.png") as image:
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "missions_scrollbar_mid.png") as image:
             result = self.analyzer.detect_primary_scrollbar(image)
 
         self.assertIsInstance(result, ScrollbarInfo)
@@ -149,10 +149,22 @@ class MenuVisionRegressionTest(unittest.TestCase):
         self.assertAlmostEqual(result.thumb_ratio, 0.66, delta=0.05)
         self.assertGreater(result.thumb_bounds[3], 200)
 
+        # Alternate mid-level capture validates renamed assets
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "missions_scrollbar_mid_alt.png") as image:
+            alt = self.analyzer.detect_primary_scrollbar(image)
+
+        self.assertIsInstance(alt, ScrollbarInfo)
+        assert alt is not None
+        self.assertGreater(alt.track_bounds[0], 860)
+        self.assertLess(alt.track_bounds[0], 900)
+        self.assertTrue(alt.can_scroll_up)
+        self.assertTrue(alt.can_scroll_down)
+        self.assertAlmostEqual(alt.thumb_ratio, 0.30, delta=0.05)
+
         # Scrollbar positioned near the very top but still scrollable downward
         for filename in [
-            "20251011-185948-primary.png",
-            "20251011-185959-primary.png",
+            "missions_scrollbar_top.png",
+            "missions_scrollbar_top_alt.png",
         ]:
             with Image.open(PRIMARY_SCROLLBAR_DIR / filename) as image:
                 scroll = self.analyzer.detect_primary_scrollbar(image)
@@ -165,6 +177,18 @@ class MenuVisionRegressionTest(unittest.TestCase):
             self.assertLess(scroll.thumb_ratio, 0.15)
             self.assertGreater(scroll.thumb_bounds[3], 40)
             self.assertTrue(scroll.can_scroll_down)
+
+        # Scrollbar offset further from the right edge but still detectable
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "missions_scrollbar_offset.png") as image:
+            scroll = self.analyzer.detect_primary_scrollbar(image)
+
+        self.assertIsInstance(scroll, ScrollbarInfo)
+        assert scroll is not None
+        self.assertGreater(scroll.track_bounds[0], 860)
+        self.assertLess(scroll.track_bounds[0], 900)
+        self.assertLess(scroll.thumb_ratio, 0.2)
+        self.assertFalse(scroll.can_scroll_up)
+        self.assertTrue(scroll.can_scroll_down)
 
 
 if __name__ == "__main__":  # pragma: no cover - allows direct invocation
