@@ -147,7 +147,7 @@ The Vision pipeline uses `google/gemini-2.5-flash-lite-preview-09-2025` on OpenR
 
 Notes:
 - Both prompts request JSON mode (`response_format: {type: "json_object"}`)
-- The left 15% of the menus crop is trimmed (`LEFT_TRIM_RATIO = 0.15`) before sending to the VLM so pinned tab icons are excluded.
+- The left 15% of the menus crop is trimmed (`LEFT_TRIM_RATIO = 0.15`) before sending to the VLM so pinned tab icons are excluded. If that trimmed view yields no buttons after a valid JSON response, the pipeline automatically retries with the full-width crop, and the reported trim ratio is used later to offset bounding boxes back into client coordinates. Malformed JSON triggers a single retry using the same trim before we consider alternate fallbacks.
 - Primary images are sent untrimmed.
 - Implementation: `lluma_vision/menu_analyzer.py`. Both calls reuse the same `OPENROUTER_API_KEY` that the agent uses.
 
@@ -160,7 +160,7 @@ Current runtime deps
 
 Processing today is intentionally minimal:
 - No denoise, CLAHE, or gamma tweaks are applied; we rely on the VLM’s robustness.
-- Menu crops are trimmed on the left via `LEFT_TRIM_RATIO` before encoding.
+- Menu crops are trimmed on the left via `LEFT_TRIM_RATIO` before encoding; the actual trim ratio is propagated so the coordinator can adjust button bounds. If the trimmed query returns no detections but was parsed successfully, we retry without trimming. If the response JSON is invalid we retry once with the same trim before giving up.
 - Scrollbar detection inspects the rightmost band of the primary crop in raw RGB space.
 
 Optional packages (`opencv-python-headless`, `scikit-image`, `ImageHash`, `pytesseract`, etc.) are kept in reserve for future experiments but are not imported by default.

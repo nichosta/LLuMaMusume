@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import requests
@@ -292,7 +292,7 @@ class MenuAnalyzer:
         else:
             return TabAvailability.UNAVAILABLE
 
-    def get_clickable_buttons(self, image_path: str) -> list[dict]:
+    def get_clickable_buttons(self, image_path: str) -> Tuple[list[dict], float]:
         """
         Uses a VLM to get clickable buttons from an image.
 
@@ -300,16 +300,25 @@ class MenuAnalyzer:
             image_path: The path to the image file.
 
         Returns:
-            A list of dictionaries, where each dictionary represents a button
-            with 'box_2d' and 'label' keys.
+            Tuple of (buttons, trim_ratio_used) where trim_ratio_used indicates the fraction
+            of the menu image that was trimmed from the left before sending it to the VLM.
         """
         image_file = Path(image_path)
         if not image_file.exists():
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
-        self._ensure_api_configured()
+        return self._detect_menu_buttons(image_file, self.LEFT_TRIM_RATIO, allow_untrim=True)
 
-        base64_image = self._prepare_api_image(image_file, trim_left_ratio=self.LEFT_TRIM_RATIO)
+    def _detect_menu_buttons(
+        self,
+        image_file: Path,
+        trim_left_ratio: float,
+        *,
+        allow_untrim: bool,
+    ) -> Tuple[list[dict], float]:
+        """Internal helper that calls the VLM and optionally retries without trimming."""
+
+        self._ensure_api_configured()
 
         system_prompt = (
             "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) "
@@ -327,45 +336,83 @@ class MenuAnalyzer:
             "Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
         )
 
-        payload = {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": user_instructions},
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
-                },
-            ],
-        }
+        parse_retry_allowed = True
+        actual_trim_ratio = trim_left_ratio
 
-        try:
-            request_body = {
-                "model": "google/gemini-2.5-flash-lite-preview-09-2025",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    payload,
+        while True:
+            base64_image, actual_trim_ratio = self._prepare_api_image(
+                image_file, trim_left_ratio=trim_left_ratio
+            )
+
+            payload = {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_instructions},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                    },
                 ],
-                "response_format": {"type": "json_object"},
-                "reasoning": {"enabled": False},  # No reasoning is recommended by Google
             }
 
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=self._headers,
-                json=request_body,
-                timeout=60,
+            buttons: list[dict] = []
+            parse_ok = False
+            try:
+                model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
+                request_body = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        payload,
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "reasoning": {"enabled": False},  # No reasoning is recommended by Google
+                }
+
+                self._logger.info(
+                    "Calling OpenRouter menus vision model %s for %s (trim_ratio=%.3f)",
+                    model_name,
+                    image_file.name,
+                    actual_trim_ratio,
+                )
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=self._headers,
+                    json=request_body,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                content = self._extract_response_content(response_data)
+                if content is not None:
+                    buttons, parse_ok = self._parse_buttons_payload(content)
+            except Exception as exc:  # pragma: no cover - network failure path
+                self._logger.error("Error querying OpenRouter: %s", exc)
+
+            if parse_ok:
+                if buttons:
+                    return buttons, actual_trim_ratio
+                break  # parsed successfully but no detections; consider full-width fallback
+
+            if parse_retry_allowed:
+                parse_retry_allowed = False
+                self._logger.warning(
+                    "Menus vision returned invalid JSON; retrying same trim (ratio=%.3f)",
+                    actual_trim_ratio,
+                )
+                continue
+
+            # Parse failed twice; give up without falling back to untrimmed data
+            return [], actual_trim_ratio
+
+        if allow_untrim and actual_trim_ratio > 0.0:
+            self._logger.warning(
+                "Menus vision returned no buttons with trim_ratio %.3f; retrying without trim",
+                actual_trim_ratio,
             )
-            response.raise_for_status()
-            response_data = response.json()
-        except Exception as exc:  # pragma: no cover - network failure path
-            self._logger.error("Error querying OpenRouter: %s", exc)
-            return []
+            return self._detect_menu_buttons(image_file, 0.0, allow_untrim=False)
 
-        content = self._extract_response_content(response_data)
-        if content is None:
-            return []
-
-        return self._parse_buttons_payload(content)
+        return [], actual_trim_ratio
 
     def get_primary_elements(self, image_path: str) -> list[dict]:
         """Detect primary-region buttons via the VLM."""
@@ -375,7 +422,7 @@ class MenuAnalyzer:
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
         self._ensure_api_configured()
-        base64_image = self._prepare_api_image(image_file, trim_left_ratio=0.0)
+        base64_image, _ = self._prepare_api_image(image_file, trim_left_ratio=0.0)
 
         system_prompt = (
             "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
@@ -403,8 +450,9 @@ class MenuAnalyzer:
         }
 
         try:
+            model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
             request_body = {
-                "model": "google/gemini-2.5-flash-lite-preview-09-2025",
+                "model": model_name,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     payload,
@@ -413,6 +461,9 @@ class MenuAnalyzer:
                 "reasoning": {"enabled": False},  # No reasoning is recommended by Google
             }
 
+            self._logger.info(
+                "Calling OpenRouter primary vision model %s for %s", model_name, image_file.name
+            )
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers=self._headers,
@@ -429,7 +480,8 @@ class MenuAnalyzer:
         if content is None:
             return []
 
-        return self._parse_buttons_payload(content)
+        buttons, parse_ok = self._parse_buttons_payload(content)
+        return buttons if parse_ok else []
 
     def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
         """Heuristically detect a vertical scrollbar within a primary capture."""
@@ -534,28 +586,30 @@ class MenuAnalyzer:
             thumb_ratio=thumb_ratio,
         )
 
-    def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> str:
+    def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> Tuple[str, float]:
         """Load, trim, and encode the image region sent to the VLM."""
 
         with Image.open(image_file) as image:
-            trimmed = self._trim_left_region(image, trim_left_ratio)
+            trimmed, actual_ratio = self._trim_left_region(image, trim_left_ratio)
             with BytesIO() as buffer:
                 trimmed.save(buffer, format="PNG")
-                return base64.b64encode(buffer.getvalue()).decode("utf-8")
+                return base64.b64encode(buffer.getvalue()).decode("utf-8"), actual_ratio
 
-    def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Image.Image:
+    def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Tuple[Image.Image, float]:
         """Remove a fixed-width strip before querying the VLM."""
 
         width, height = image.size
         if width <= 0 or height <= 0:
-            return image.copy()
+            return image.copy(), 0.0
 
-        trim_px = int(width * max(0.0, min(trim_left_ratio, 1.0)))
+        clamp_ratio = max(0.0, min(trim_left_ratio, 1.0))
+        trim_px = int(round(width * clamp_ratio))
         if trim_px >= width:
             trim_px = max(0, width - 1)
 
+        actual_ratio = (trim_px / width) if width else 0.0
         cropped = image.crop((trim_px, 0, width, height))
-        return cropped.copy()
+        return cropped.copy(), actual_ratio
 
     def _largest_segment(self, mask: np.ndarray, min_length: int) -> Optional[tuple[int, int]]:
         """Return the longest contiguous True segment meeting the minimum length."""
@@ -615,12 +669,16 @@ class MenuAnalyzer:
             self._logger.error("Unexpected OpenRouter response schema: %s", exc)
             return None
 
-    def _parse_buttons_payload(self, raw_json: str) -> list[dict]:
-        """Parse a JSON payload containing a buttons array."""
+    def _parse_buttons_payload(self, raw_json: str) -> Tuple[list[dict], bool]:
+        """Parse a JSON payload containing a buttons array.
 
-        payload = self._load_json_document(raw_json)
-        if payload is None:
-            return []
+        Returns:
+            (buttons, parse_ok) where parse_ok indicates whether JSON decoding succeeded.
+        """
+
+        payload, parse_ok = self._load_json_document(raw_json)
+        if not parse_ok:
+            return [], False
 
         buttons_field: Any
         if isinstance(payload, dict):
@@ -628,7 +686,7 @@ class MenuAnalyzer:
         else:
             buttons_field = payload
 
-        return self._parse_buttons_array(buttons_field)
+        return self._parse_buttons_array(buttons_field), True
 
     def _parse_buttons_array(self, buttons_field: Any) -> list[dict]:
         """Normalize a list of button entries."""
@@ -658,7 +716,7 @@ class MenuAnalyzer:
 
         return buttons
 
-    def _load_json_document(self, raw_json: str) -> Optional[Any]:
+    def _load_json_document(self, raw_json: str) -> Tuple[Optional[Any], bool]:
         """Strip common wrappers and parse JSON content."""
 
         cleaned = raw_json.strip()
@@ -668,10 +726,10 @@ class MenuAnalyzer:
             cleaned = cleaned[: -3].strip()
 
         try:
-            return json.loads(cleaned)
+            return json.loads(cleaned), True
         except json.JSONDecodeError as exc:
             self._logger.error("Failed to decode OpenRouter JSON: %s", exc)
-            return None
+            return None, False
 
     def _normalise_box_values(self, box: list[Any]) -> list[float]:
         """Convert box values to floats clamped to the expected 0-1000 range."""
