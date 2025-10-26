@@ -147,7 +147,7 @@ The Vision pipeline uses `google/gemini-2.5-flash-lite-preview-09-2025` on OpenR
 
 Notes:
 - Both prompts request JSON mode (`response_format: {type: "json_object"}`)
-- The left 15% of the menus crop is trimmed (`LEFT_TRIM_RATIO = 0.15`) before sending to the VLM so pinned tab icons are excluded. If that trimmed view yields no buttons after a valid JSON response, the pipeline automatically retries with the full-width crop, and the reported trim ratio is used later to offset bounding boxes back into client coordinates. Malformed JSON triggers a single retry using the same trim before we consider alternate fallbacks.
+- If menu response is empty or malformed, retry up to two times, logging both the prompt and response of the failed calls. If three failures are recorded, the menu should be assumed to be empty.
 - Primary images are sent untrimmed.
 - Implementation: `lluma_vision/menu_analyzer.py`. Both calls reuse the same `OPENROUTER_API_KEY` that the agent uses.
 

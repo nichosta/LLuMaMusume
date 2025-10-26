@@ -663,7 +663,7 @@ class MenuAnalyzer:
         self._api_key = api_key
         self._headers = {
             "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+            "HTTP-Referer": "https://github.com/nichosta/LLuMaMusume",
             "X-Title": "LLuMa Musume Agent",
             "Content-Type": "application/json",
         }
