@@ -1,13 +1,15 @@
 window:
   title: "Umamusume"
   scaling_factor: 1.5           # 150% DPI scaling
-  client_offset: [6, 30]        # Offset from outer to client area (logical pixels)
   placement:
     x: 0
     y: 0
     width: 1920
-    height: 1080
+# Putting the "correct" height here results in a bug that offsets click locations from pointer locations once the window is placed
+# Must put a wrong height here to prevent this
+    height: 1
 
+# Measured values
 capture:
   split:
     left_pin_ratio: 0.07874    # Left pin area (discarded)

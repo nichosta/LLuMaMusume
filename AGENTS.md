@@ -276,6 +276,7 @@ The agent runs indefinitely until manual intervention (Ctrl-C in the terminal). 
 - No mock/replay testing infrastructure is currently available; all testing is performed against the live game.
 - Debug logging can be configured via verbosity levels (error, warn, info, debug, trace).
 - Captures are retained (last 200 turns by default) for post-mortem analysis.
+- For quick window experiments (e.g., reproducing DPI or cursor drift issues) use `python -m lluma_os.window_cli <command>`; it can `status`, `focus`, `place`, `move`, `resize`, or `set` the Uma Musume window using logical-pixel coordinates from `config.yaml`.
 
 ## Error Recovery
 - **Window closure**: If the game window is closed, the program immediately stops.
