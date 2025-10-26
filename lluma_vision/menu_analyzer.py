@@ -341,7 +341,9 @@ class MenuAnalyzer:
 
         while True:
             base64_image, actual_trim_ratio = self._prepare_api_image(
-                image_file, trim_left_ratio=trim_left_ratio
+                image_file,
+                trim_left_ratio=trim_left_ratio,
+                include_trim_ratio=True,
             )
 
             payload = {
@@ -385,7 +387,9 @@ class MenuAnalyzer:
                 response_data = response.json()
                 content = self._extract_response_content(response_data)
                 if content is not None:
-                    buttons, parse_ok = self._parse_buttons_payload(content)
+                    buttons, parse_ok = self._parse_buttons_payload(
+                        content, return_status=True
+                    )
             except Exception as exc:  # pragma: no cover - network failure path
                 self._logger.error("Error querying OpenRouter: %s", exc)
 
@@ -422,7 +426,9 @@ class MenuAnalyzer:
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
         self._ensure_api_configured()
-        base64_image, _ = self._prepare_api_image(image_file, trim_left_ratio=0.0)
+        base64_image, _ = self._prepare_api_image(
+            image_file, trim_left_ratio=0.0, include_trim_ratio=True
+        )
 
         system_prompt = (
             "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
@@ -480,7 +486,9 @@ class MenuAnalyzer:
         if content is None:
             return []
 
-        buttons, parse_ok = self._parse_buttons_payload(content)
+        buttons, parse_ok = self._parse_buttons_payload(
+            content, return_status=True
+        )
         return buttons if parse_ok else []
 
     def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
@@ -586,14 +594,21 @@ class MenuAnalyzer:
             thumb_ratio=thumb_ratio,
         )
 
-    def _prepare_api_image(self, image_file: Path, trim_left_ratio: float = 0.0) -> Tuple[str, float]:
+    def _prepare_api_image(
+        self,
+        image_file: Path,
+        trim_left_ratio: float = 0.0,
+        *,
+        include_trim_ratio: bool = False,
+    ) -> Any:
         """Load, trim, and encode the image region sent to the VLM."""
 
         with Image.open(image_file) as image:
             trimmed, actual_ratio = self._trim_left_region(image, trim_left_ratio)
             with BytesIO() as buffer:
                 trimmed.save(buffer, format="PNG")
-                return base64.b64encode(buffer.getvalue()).decode("utf-8"), actual_ratio
+                encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return (encoded, actual_ratio) if include_trim_ratio else encoded
 
     def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Tuple[Image.Image, float]:
         """Remove a fixed-width strip before querying the VLM."""
@@ -669,16 +684,20 @@ class MenuAnalyzer:
             self._logger.error("Unexpected OpenRouter response schema: %s", exc)
             return None
 
-    def _parse_buttons_payload(self, raw_json: str) -> Tuple[list[dict], bool]:
+    def _parse_buttons_payload(
+        self, raw_json: str, *, return_status: bool = False
+    ) -> Any:
         """Parse a JSON payload containing a buttons array.
 
-        Returns:
-            (buttons, parse_ok) where parse_ok indicates whether JSON decoding succeeded.
+        When ``return_status`` is ``False`` this method mirrors the historical
+        behaviour used by tests by returning only the parsed button list. Internal
+        callers that need to know whether decoding succeeded can request the status
+        flag via ``return_status=True``.
         """
 
         payload, parse_ok = self._load_json_document(raw_json)
         if not parse_ok:
-            return [], False
+            return ([], False) if return_status else []
 
         buttons_field: Any
         if isinstance(payload, dict):
@@ -686,7 +705,8 @@ class MenuAnalyzer:
         else:
             buttons_field = payload
 
-        return self._parse_buttons_array(buttons_field), True
+        parsed = self._parse_buttons_array(buttons_field)
+        return (parsed, True) if return_status else parsed
 
     def _parse_buttons_array(self, buttons_field: Any) -> list[dict]:
         """Normalize a list of button entries."""
