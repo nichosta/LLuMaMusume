@@ -113,7 +113,8 @@ class MenuVisionRegressionTest(unittest.TestCase):
 
         self.assertListEqual(state.available_tabs(), ["Jukebox", "Menu"])
 
-    def test_prepare_api_image_trims_left_region(self) -> None:
+    def test_prepare_api_image_no_trim_by_default(self) -> None:
+        """Verify that menu images are not trimmed by default (tabs are already separated)."""
         analyzer = MenuAnalyzer()
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -124,7 +125,8 @@ class MenuVisionRegressionTest(unittest.TestCase):
             encoded = analyzer._prepare_api_image(path, trim_left_ratio=MenuAnalyzer.LEFT_TRIM_RATIO)
             decoded = base64.b64decode(encoded)
             with Image.open(io.BytesIO(decoded)) as trimmed:
-                self.assertEqual(trimmed.size, (85, 40))
+                # Should match original size since LEFT_TRIM_RATIO is now 0.0
+                self.assertEqual(trimmed.size, (100, 40))
 
     def test_detect_primary_scrollbar_samples(self) -> None:
         """Validate scrollbar heuristics against reference captures."""

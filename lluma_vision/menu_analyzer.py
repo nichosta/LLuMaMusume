@@ -64,14 +64,14 @@ class MenuAnalyzer:
     # Tab names from top to bottom
     TAB_NAMES = [
         "Jukebox",
-        "Sparks", 
+        "Sparks",
         "Log",
         "Career Profile",
         "Agenda",
         "Item Request",
         "Menu"
     ]
-    LEFT_TRIM_RATIO = 0.15  # proportion of image width trimmed from the left before VLM calls
+    LEFT_TRIM_RATIO = 0.0  # tabs are already in a separate image; no trimming needed
     PRIMARY_SCROLLBAR_BAND_WIDTH = 220  # width of primary-image band used for scrollbar detection
     SCROLLBAR_MIN_WIDTH = 8
     SCROLLBAR_MAX_WIDTH = 16
@@ -321,8 +321,9 @@ class MenuAnalyzer:
         self._ensure_api_configured()
 
         system_prompt = (
-            "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) "
-            "to find interactive buttons. Respond with JSON listing each distinct clickable button once. "
+            "You analyse Uma Musume menu content screenshots to find interactive buttons. "
+            "The vertical tab column has already been separated into a different image, so this crop contains only the menu's content area. "
+            "Respond with JSON listing each distinct clickable button once. "
             "Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] "
             "with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; "
             "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags. "
@@ -391,22 +392,54 @@ class MenuAnalyzer:
                         content, return_status=True
                     )
             except Exception as exc:  # pragma: no cover - network failure path
-                self._logger.error("Error querying OpenRouter: %s", exc)
+                self._logger.error(
+                    "Error querying OpenRouter for %s: %s\n"
+                    "System prompt: %s\n"
+                    "User instructions: %s\n"
+                    "Trim ratio: %.3f",
+                    image_file.name,
+                    exc,
+                    system_prompt,
+                    user_instructions,
+                    actual_trim_ratio,
+                )
+                # Try to log response if we got one
+                try:
+                    if 'response' in locals():
+                        self._logger.error("Response status: %d, content: %s", response.status_code, response.text[:500])
+                except Exception:
+                    pass
 
             if parse_ok:
                 if buttons:
                     return buttons, actual_trim_ratio
-                break  # parsed successfully but no detections; consider full-width fallback
+                # Parsed successfully but no detections
+                self._logger.warning(
+                    "Menus vision parsed successfully but returned no buttons for %s (trim_ratio=%.3f)",
+                    image_file.name,
+                    actual_trim_ratio,
+                )
+                break  # consider full-width fallback
 
             if parse_retry_allowed:
                 parse_retry_allowed = False
                 self._logger.warning(
-                    "Menus vision returned invalid JSON; retrying same trim (ratio=%.3f)",
+                    "Menus vision returned invalid JSON for %s; retrying same trim (ratio=%.3f)\n"
+                    "Response content: %s",
+                    image_file.name,
                     actual_trim_ratio,
+                    content[:500] if content else "(no content)",
                 )
                 continue
 
             # Parse failed twice; give up without falling back to untrimmed data
+            self._logger.error(
+                "Menus vision failed to parse JSON after 2 attempts for %s (trim_ratio=%.3f)\n"
+                "Last response: %s",
+                image_file.name,
+                actual_trim_ratio,
+                content[:500] if content else "(no content)",
+            )
             return [], actual_trim_ratio
 
         if allow_untrim and actual_trim_ratio > 0.0:
@@ -479,16 +512,40 @@ class MenuAnalyzer:
             response.raise_for_status()
             response_data = response.json()
         except Exception as exc:  # pragma: no cover - network failure path
-            self._logger.error("Error querying OpenRouter: %s", exc)
+            self._logger.error(
+                "Error querying OpenRouter primary vision for %s: %s\n"
+                "System prompt: %s\n"
+                "User instructions: %s",
+                image_file.name,
+                exc,
+                system_prompt,
+                user_instructions,
+            )
+            # Try to log response if we got one
+            try:
+                if 'response' in locals():
+                    self._logger.error("Response status: %d, content: %s", response.status_code, response.text[:500])
+            except Exception:
+                pass
             return []
 
         content = self._extract_response_content(response_data)
         if content is None:
+            self._logger.warning("Primary vision returned no content for %s", image_file.name)
             return []
 
         buttons, parse_ok = self._parse_buttons_payload(
             content, return_status=True
         )
+        if not parse_ok:
+            self._logger.error(
+                "Primary vision failed to parse JSON for %s\n"
+                "Response content: %s",
+                image_file.name,
+                content[:500] if content else "(no content)",
+            )
+        elif not buttons:
+            self._logger.info("Primary vision parsed successfully but returned no buttons for %s", image_file.name)
         return buttons if parse_ok else []
 
     def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
