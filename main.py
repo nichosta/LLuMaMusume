@@ -45,7 +45,10 @@ def main() -> int:
         return 1
 
     logger.info("Configuration loaded successfully")
-    logger.info("  Window: %s @ %dx%d", window_cfg.title, window_cfg.placement.width, window_cfg.placement.height)
+    if window_cfg.placement:
+        logger.info("  Window: %s @ %dx%d", window_cfg.title, window_cfg.placement.width, window_cfg.placement.height)
+    else:
+        logger.info("  Window: %s (dynamic positioning)", window_cfg.title)
     logger.info("  DPI scaling: %.1fx", window_cfg.scaling_factor)
     logger.info("  Agent model: %s", agent_cfg.model)
     logger.info("  Memory dir: %s", agent_cfg.memory_dir)

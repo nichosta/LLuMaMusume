@@ -29,9 +29,7 @@ class WindowConfig:
     """Window discovery and placement parameters."""
 
     title: str = "Umamusume"
-    placement: WindowPlacement = field(
-        default_factory=lambda: WindowPlacement(x=0, y=0, width=1920, height=1080)
-    )
+    placement: Optional[WindowPlacement] = None  # If None, window is not repositioned
     scaling_factor: float = 1.5
     client_offset: Optional[Tuple[int, int]] = None  # (dx, dy) from outer top-left to client, in logical pixels
 
@@ -136,14 +134,16 @@ def _apply_window_config(config: WindowConfig, data: Dict) -> None:
     if title:
         config.title = title
 
-    placement_data = data.get("placement") or {}
-    if placement_data:
-        config.placement = WindowPlacement(
-            x=int(placement_data.get("x", config.placement.x)),
-            y=int(placement_data.get("y", config.placement.y)),
-            width=int(placement_data.get("width", config.placement.width)),
-            height=int(placement_data.get("height", config.placement.height)),
-        )
+    placement_data = data.get("placement")
+    if placement_data and isinstance(placement_data, dict):
+        # Only create placement if all required fields are present
+        if all(key in placement_data for key in ("x", "y", "width", "height")):
+            config.placement = WindowPlacement(
+                x=int(placement_data["x"]),
+                y=int(placement_data["y"]),
+                width=int(placement_data["width"]),
+                height=int(placement_data["height"]),
+            )
 
     dpi_data = data.get("dpi") or {}
     scaling_factor = data.get("scaling_factor") or dpi_data.get("scaling_factor")

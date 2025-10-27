@@ -181,7 +181,15 @@ class UmaWindow:
         return self._window
 
     def ensure_placement(self) -> None:
-        """Move and resize the window to the configured placement."""
+        """Move and resize the window to the configured placement.
+
+        If no placement is configured, this method does nothing and the window
+        remains at its current position/size.
+        """
+        if self._config.placement is None:
+            self._logger.debug("No placement configured; window will not be repositioned")
+            return
+
         window = self._locate_window()
         placement = self._config.placement
 

@@ -9,7 +9,7 @@ class LoadConfigsTest(unittest.TestCase):
     def test_defaults_when_missing_file(self) -> None:
         window_cfg, capture_cfg, agent_cfg = load_configs(Path("nonexistent.yaml"))
         self.assertEqual(window_cfg.title, "Umamusume")
-        self.assertEqual(window_cfg.placement.width, 1920)
+        self.assertIsNone(window_cfg.placement)  # Placement is optional, defaults to None
         self.assertEqual(capture_cfg.output_dir, Path("captures"))
         self.assertEqual(capture_cfg.scaling_factor, window_cfg.scaling_factor)
         self.assertEqual(agent_cfg.model, "anthropic/claude-haiku-4.5")

@@ -1,15 +1,13 @@
 window:
   title: "Umamusume"
   scaling_factor: 1.5           # 150% DPI scaling
-  placement:
-    x: 0
-    y: 0
-    width: 1920
-# Putting the "correct" height here results in a bug that offsets click locations from pointer locations once the window is placed
-# Must put a wrong height here to prevent this
-    height: 1
+  # placement:                   # Optional: Uncomment to auto-position window at startup
+  #   x: 0
+  #   y: 0
+  #   width: 1920
+  #   height: 1080
 
-# Measured values
+# Measured values from client area
 capture:
   split:
     left_pin_ratio: 0.07874    # Left pin area (discarded)

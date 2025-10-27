@@ -12,7 +12,7 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 - Python: 3.13.8 (x64), uv for package management.
 - Display: 2560×1600 (16:10 aspect ratio, single monitor recommended; display scaling 150%)
 - Game: Uma Musume Pretty Derby (Steam)
-- Game mode: Windowed, positioned at (0,0) with outer size 1920×1080 (approximately 16:9)
+- Game mode: Windowed (position and size are dynamically queried; manual adjustment is supported)
 - Client area: ~2539×1384 physical pixels (~1693×923 logical pixels, measured in practice)
 - Locale: English (NA)
 - Admin: Not required
@@ -21,12 +21,12 @@ Experimental harness for Uma Musume gameplay on Windows by an LLM agent.
 
 - Window title: Exact match "Umamusume" (Steam EN/NA). Fail fast if not found.
 - Focus/visibility: Ensure window is restored, unminimized, and foregrounded before inputs. Abort inputs if focus fails.
-- Placement: On startup, position window at `x=0, y=0` and size to `1920×1080` (outer size). Re-fetch bounds after resizing.
+- Placement: **Dynamic positioning** - Window geometry (position, size, client area) is queried fresh every turn via `refresh_geometry()`. The user may manually move or resize the window at any time without breaking the agent. Optional: Configure `window.placement` in `config.yaml` to auto-position the window at startup only.
 - Client area origin: Use the client-area top-left as `(0,0)` for all in-game coordinates. Normalize all tool inputs and Vision outputs to this origin.
 - DPI scaling (150%): After calling `SetProcessDPIAware()` (see OS → DPI Awareness section), all window APIs (`GetWindowRect`, `GetClientRect`, `ClientToScreen`) return physical screen pixels. Vision outputs client-relative logical pixels, which must be multiplied by 1.5 and added to the physical client origin. See OS section for detailed conversion formulas.
-- Bounds source: Prefer client-area bounds. If only outer bounds are available, account for title bar and borders or measure client offsets at runtime after placement.
-- Stability: Window dimensions are assumed stable during a run; refresh bounds after any explicit resize/reposition only.
-- Multi-monitor: Single monitor recommended. If multiple, require window on primary display at `(0,0)`.
+- Bounds source: Client-area bounds and window position are queried every turn using `ClientToScreen()` and `GetClientRect()` to ensure accuracy regardless of window position or DWM adjustments.
+- Stability: Window dimensions/position are **NOT** assumed stable; they are re-measured every turn. This allows the window to be manually moved or resized without restarting the agent.
+- Multi-monitor: Single monitor recommended. The agent works regardless of window position.
 - Errors: If window is occluded/not found, log and skip the turn (no inputs) rather than sending blind clicks.
 
 # OS
@@ -58,15 +58,19 @@ After setting DPI awareness:
 **Coordinate conversion** (Vision logical → PyAutoGUI physical):
 ```python
 # Vision output: (x_logical, y_logical) relative to client area
-# Config: client_offset = [6, 30] in logical pixels
-# Window position from pygetwindow: (win_x_phys, win_y_phys) in physical pixels
+# Client origin is obtained via ClientToScreen() each turn (physical pixels)
+# Window geometry is refreshed every turn to handle manual moves/resizes
 
-client_origin_x_phys = win_x_phys + (client_offset[0] * 1.5)
-client_origin_y_phys = win_y_phys + (client_offset[1] * 1.5)
+# From WindowGeometry obtained via refresh_geometry():
+client_origin_x_phys = geometry.client_area.screen_origin[0]
+client_origin_y_phys = geometry.client_area.screen_origin[1]
+scaling_factor = geometry.client_area.scaling_factor  # 1.5 for 150% DPI
 
-screen_x_phys = client_origin_x_phys + (x_logical * 1.5)
-screen_y_phys = client_origin_y_phys + (y_logical * 1.5)
+screen_x_phys = client_origin_x_phys + (x_logical * scaling_factor)
+screen_y_phys = client_origin_y_phys + (y_logical * scaling_factor)
 ```
+
+Note: `client_offset` in config.yaml is optional and rarely needed. By default, `ClientToScreen(hwnd, {0,0})` is used to determine the client area origin dynamically.
 
 ## Input
 
@@ -240,9 +244,9 @@ Safety and limits
 
 Window
 - `title`: Window title to match (default `"Umamusume"`).
-- `placement`: `{ x: 0, y: 0, width: 1920, height: 1080 }` outer bounds requested on startup.
+- `placement`: Optional. If specified with `{ x, y, width, height }`, the window will be positioned at startup only. If omitted (default), the window position is never changed and is queried dynamically each turn.
 - `scaling_factor`: 1.5 for the current 150 % DPI setup.
-- `client_offset`: `[6, 30]` logical pixels from the outer top-left to the client origin. When omitted we fall back to `ClientToScreen`.
+- `client_offset`: Optional. Logical pixel offset from outer top-left to client origin. Rarely needed; by default `ClientToScreen(hwnd, {0,0})` is used to determine the client area origin dynamically.
 
 Capture
 - `output_dir`: defaults to `captures/`.
@@ -276,7 +280,7 @@ The agent runs indefinitely until manual intervention (Ctrl-C in the terminal). 
 - No mock/replay testing infrastructure is currently available; all testing is performed against the live game.
 - Debug logging can be configured via verbosity levels (error, warn, info, debug, trace).
 - Captures are retained (last 200 turns by default) for post-mortem analysis.
-- For quick window experiments (e.g., reproducing DPI or cursor drift issues) use `python -m lluma_os.window_cli <command>`; it can `status`, `focus`, `place`, `move`, `resize`, or `set` the Uma Musume window using logical-pixel coordinates from `config.yaml`.
+- For quick window experiments (e.g., reproducing DPI or cursor drift issues) use `python -m lluma_os.window_cli <command>`; it can `status`, `focus`, `place`, `move`, `resize`, or `set` the Uma Musume window using logical-pixel coordinates. The `place` command requires `window.placement` to be configured in `config.yaml`.
 
 ## Error Recovery
 - **Window closure**: If the game window is closed, the program immediately stops.
@@ -319,7 +323,7 @@ Install Python 3.13.8 (x64), then install dependencies via `uv pip install -r re
 Environment
 - Set `OPENROUTER_API_KEY` in the environment for Vision and Agent calls.
 - Ensure Steam window title is exactly `Umamusume`.
-- First-run checklist: verify window placement (0,0 @ 1920×1080), confirm capture works, adjust split ratios as needed.
+- First-run checklist: Ensure the game window is open and visible (position/size don't matter), confirm capture works, adjust split ratios as needed. Optionally configure `window.placement` in config.yaml for auto-positioning at startup.
 
 # TODO / Future Work
 
