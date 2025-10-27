@@ -9,7 +9,7 @@ import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from lluma_os.capture import CaptureManager, CaptureError
 from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
@@ -139,6 +139,10 @@ class GameLoopCoordinator:
         self._capture_config = capture_config
         self._should_stop = False
         self._turn_counter = 0
+
+        # Cache for menu button results (reuse if tab hasn't changed and VLM fails)
+        self._last_menu_tab: Optional[str] = None
+        self._last_menu_buttons_raw: List[Dict[str, Any]] = []
 
         # Ensure DPI awareness is set before any window operations
         set_dpi_aware()
@@ -332,15 +336,31 @@ class GameLoopCoordinator:
 
             # Button detection in menus
             if menu_state.is_usable:
-                menu_buttons_raw, trim_ratio = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+
+                # If VLM returned no buttons but tab hasn't changed, reuse previous results
+                if (
+                    not menu_buttons_raw
+                    and menu_state.selected_tab is not None
+                    and menu_state.selected_tab == self._last_menu_tab
+                    and self._last_menu_buttons_raw
+                ):
+                    self._logger.info(
+                        "Menu VLM returned no buttons for tab '%s'; reusing %d buttons from previous turn",
+                        menu_state.selected_tab,
+                        len(self._last_menu_buttons_raw),
+                    )
+                    menu_buttons_raw = self._last_menu_buttons_raw
+
+                # Update cache for next turn
+                self._last_menu_tab = menu_state.selected_tab
+                self._last_menu_buttons_raw = menu_buttons_raw
+
                 # Images are in physical pixels, convert to logical for coordinate system
                 menus_width_physical, menus_height_physical = capture_result.menus_image.size
                 scaling_factor = capture_result.geometry.client_area.scaling_factor
                 menus_width_logical = int(round(menus_width_physical / scaling_factor))
                 menus_height_logical = int(round(menus_height_physical / scaling_factor))
-
-                trim_offset_logical = int(round(menus_width_logical * trim_ratio))
-                trimmed_width_logical = max(menus_width_logical - trim_offset_logical, 1)
 
                 full_width = capture_result.geometry.client_area.width_logical
                 offset_x, offset_y = calculate_region_offset("menus", self._capture_config, full_width)
@@ -350,11 +370,11 @@ class GameLoopCoordinator:
                     # Convert VLM box [ymin, xmin, ymax, xmax] (0-1000) to logical pixel bounds
                     x, y, w, h = convert_vlm_box_to_pixels(
                         btn_raw["box_2d"],
-                        trimmed_width_logical,
+                        menus_width_logical,
                         menus_height_logical
                     )
                     # Apply region offset to convert to full client coordinates
-                    bounds = (x + offset_x + trim_offset_logical, y + offset_y, w, h)
+                    bounds = (x + offset_x, y + offset_y, w, h)
                     buttons.append({
                         "name": name,
                         "full_label": btn_raw["label"],
@@ -362,6 +382,10 @@ class GameLoopCoordinator:
                         "metadata": metadata,
                         "region": "menus",
                     })
+            else:
+                # Menu not usable; clear cache
+                self._last_menu_tab = None
+                self._last_menu_buttons_raw = []
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():

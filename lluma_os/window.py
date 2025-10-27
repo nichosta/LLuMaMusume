@@ -181,7 +181,15 @@ class UmaWindow:
         return self._window
 
     def ensure_placement(self) -> None:
-        """Move and resize the window to the configured placement."""
+        """Move and resize the window to the configured placement.
+
+        If no placement is configured, this method does nothing and the window
+        remains at its current position/size.
+        """
+        if self._config.placement is None:
+            self._logger.debug("No placement configured; window will not be repositioned")
+            return
+
         window = self._locate_window()
         placement = self._config.placement
 
@@ -212,6 +220,43 @@ class UmaWindow:
             raise ctypes.WinError()  # pragma: no cover - direct system failure
         time.sleep(0.05)
         # Refresh cached geometry the next time it is requested.
+
+    def move_resize(
+        self,
+        x: Optional[int] = None,
+        y: Optional[int] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        repaint: bool = True,
+    ) -> None:
+        """Move and/or resize the window using logical outer-bounds coordinates."""
+
+        self._require_windows()
+        window = self._locate_window(force_refresh=True)
+
+        scaling_factor = self._config.scaling_factor
+        current_logical_x = int(round(window.left / scaling_factor))
+        current_logical_y = int(round(window.top / scaling_factor))
+        current_logical_width = int(round(window.width / scaling_factor))
+        current_logical_height = int(round(window.height / scaling_factor))
+
+        logical_x = x if x is not None else current_logical_x
+        logical_y = y if y is not None else current_logical_y
+        logical_width = width if width is not None else current_logical_width
+        logical_height = height if height is not None else current_logical_height
+
+        screen_bounds = (
+            ctypes.windll.user32.GetSystemMetrics(0),
+            ctypes.windll.user32.GetSystemMetrics(1),
+        )
+        physical_x, physical_y, physical_width, physical_height = self._logical_rect_to_physical(
+            logical_x, logical_y, logical_width, logical_height, screen_bounds
+        )
+
+        hwnd = window._hWnd  # pylint: disable=protected-access
+        if not ctypes.windll.user32.MoveWindow(hwnd, physical_x, physical_y, physical_width, physical_height, repaint):
+            raise ctypes.WinError()  # pragma: no cover - direct system failure
+        time.sleep(0.05)
 
     def focus(self) -> None:
         """Bring the window to the foreground; raises if this fails."""

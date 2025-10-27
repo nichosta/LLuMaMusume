@@ -64,18 +64,17 @@ class MenuAnalyzer:
     # Tab names from top to bottom
     TAB_NAMES = [
         "Jukebox",
-        "Sparks", 
+        "Sparks",
         "Log",
         "Career Profile",
         "Agenda",
         "Item Request",
         "Menu"
     ]
-    LEFT_TRIM_RATIO = 0.15  # proportion of image width trimmed from the left before VLM calls
     PRIMARY_SCROLLBAR_BAND_WIDTH = 220  # width of primary-image band used for scrollbar detection
     SCROLLBAR_MIN_WIDTH = 8
     SCROLLBAR_MAX_WIDTH = 16
-    SCROLLBAR_SEARCH_WIDTH = 160  # search only within this many pixels of the right edge
+    SCROLLBAR_SEARCH_WIDTH = 200  # restrict detection to this many pixels from the right edge
     SCROLLBAR_MIN_EDGE_STRENGTH = 5.0
     SCROLLBAR_SMOOTH_KERNEL = 9
     SCROLLBAR_THUMB_DELTA = 28.0
@@ -292,37 +291,26 @@ class MenuAnalyzer:
         else:
             return TabAvailability.UNAVAILABLE
 
-    def get_clickable_buttons(self, image_path: str) -> Tuple[list[dict], float]:
+    def get_clickable_buttons(self, image_path: str) -> list[dict]:
         """
-        Uses a VLM to get clickable buttons from an image.
+        Uses a VLM to get clickable buttons from a menu image.
 
         Args:
             image_path: The path to the image file.
 
         Returns:
-            Tuple of (buttons, trim_ratio_used) where trim_ratio_used indicates the fraction
-            of the menu image that was trimmed from the left before sending it to the VLM.
+            List of button dictionaries with 'label' and 'box_2d' keys.
         """
         image_file = Path(image_path)
         if not image_file.exists():
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
-        return self._detect_menu_buttons(image_file, self.LEFT_TRIM_RATIO, allow_untrim=True)
-
-    def _detect_menu_buttons(
-        self,
-        image_file: Path,
-        trim_left_ratio: float,
-        *,
-        allow_untrim: bool,
-    ) -> Tuple[list[dict], float]:
-        """Internal helper that calls the VLM and optionally retries without trimming."""
-
         self._ensure_api_configured()
 
         system_prompt = (
-            "You analyse Uma Musume UI screenshots (already cropped to exclude fixed-position menu tabs) "
-            "to find interactive buttons. Respond with JSON listing each distinct clickable button once. "
+            "You analyse Uma Musume menu content screenshots to find interactive buttons. "
+            "The vertical tab column has already been separated into a different image, so this crop contains only the menu's content area. "
+            "Respond with JSON listing each distinct clickable button once. "
             "Each record must contain a `label` string and `box_2d` array representing [ymin, xmin, ymax, xmax] "
             "with values in the range 0-1000 (normalised coordinates). The label should begin with the button name; "
             "optionally append metadata like `|section=menus` or `|hint=...`, but avoid confidence, state, or type tags. "
@@ -336,28 +324,25 @@ class MenuAnalyzer:
             "Exclude decorative or inactive elements. If no buttons are present, respond with `{\"buttons\": []}`."
         )
 
-        parse_retry_allowed = True
-        actual_trim_ratio = trim_left_ratio
+        base64_image = self._prepare_api_image(image_file)
 
-        while True:
-            base64_image, actual_trim_ratio = self._prepare_api_image(
-                image_file,
-                trim_left_ratio=trim_left_ratio,
-                include_trim_ratio=True,
-            )
+        payload = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": user_instructions},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{base64_image}"},
+                },
+            ],
+        }
 
-            payload = {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_instructions},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/png;base64,{base64_image}"},
-                    },
-                ],
-            }
+        # Allow up to 3 total attempts (1 initial + 2 retries)
+        max_attempts = 3
+        content = None
 
-            buttons: list[dict] = []
+        for attempt in range(max_attempts):
+            buttons: list[dict] = []  # type: ignore
             parse_ok = False
             try:
                 model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
@@ -372,10 +357,9 @@ class MenuAnalyzer:
                 }
 
                 self._logger.info(
-                    "Calling OpenRouter menus vision model %s for %s (trim_ratio=%.3f)",
+                    "Calling OpenRouter menus vision model %s for %s",
                     model_name,
                     image_file.name,
-                    actual_trim_ratio,
                 )
                 response = requests.post(
                     "https://openrouter.ai/api/v1/chat/completions",
@@ -391,44 +375,70 @@ class MenuAnalyzer:
                         content, return_status=True
                     )
             except Exception as exc:  # pragma: no cover - network failure path
-                self._logger.error("Error querying OpenRouter: %s", exc)
+                self._logger.error(
+                    "Error querying OpenRouter menus vision for %s: %s\n"
+                    "System prompt: %s\n"
+                    "User instructions: %s",
+                    image_file.name,
+                    exc,
+                    system_prompt,
+                    user_instructions,
+                )
+                # Try to log response if we got one
+                try:
+                    if 'response' in locals():
+                        self._logger.error("Response status: %d, content: %s", response.status_code, response.text[:500])
+                except Exception:
+                    pass
+                return []
 
             if parse_ok:
+                # If we have buttons, we're done
                 if buttons:
-                    return buttons, actual_trim_ratio
-                break  # parsed successfully but no detections; consider full-width fallback
+                    return buttons
 
-            if parse_retry_allowed:
-                parse_retry_allowed = False
+                # If we have no buttons but more attempts left, log and retry
+                if attempt < max_attempts - 1:
+                    self._logger.warning(
+                        "Menus vision returned empty list for %s; retrying (attempt %d/%d)",
+                        image_file.name,
+                        attempt + 2,
+                        max_attempts,
+                    )
+                    continue
+                else:
+                    self._logger.info("Menus vision returned no buttons for %s after %d attempts", image_file.name, max_attempts)
+                    return []
+
+            # If parsing failed but we have more attempts left, log and retry
+            if attempt < max_attempts - 1:
                 self._logger.warning(
-                    "Menus vision returned invalid JSON; retrying same trim (ratio=%.3f)",
-                    actual_trim_ratio,
+                    "Menus vision returned invalid JSON for %s; retrying (attempt %d/%d)\n"
+                    "Response content: %s",
+                    image_file.name,
+                    attempt + 2,
+                    max_attempts,
+                    content[:500] if content else "(no content)",
                 )
                 continue
 
-            # Parse failed twice; give up without falling back to untrimmed data
-            return [], actual_trim_ratio
-
-        if allow_untrim and actual_trim_ratio > 0.0:
-            self._logger.warning(
-                "Menus vision returned no buttons with trim_ratio %.3f; retrying without trim",
-                actual_trim_ratio,
-            )
-            return self._detect_menu_buttons(image_file, 0.0, allow_untrim=False)
-
-        return [], actual_trim_ratio
+        # This part is reached after all attempts fail to parse
+        self._logger.error(
+            "Menus vision failed to parse JSON after %d attempts for %s",
+            max_attempts,
+            image_file.name,
+        )
+        return []
 
     def get_primary_elements(self, image_path: str) -> list[dict]:
-        """Detect primary-region buttons via the VLM."""
+        """Detect primary-region buttons via the VLM with retry logic."""
 
         image_file = Path(image_path)
         if not image_file.exists():
             raise FileNotFoundError(f"Image path does not exist: {image_file}")
 
         self._ensure_api_configured()
-        base64_image, _ = self._prepare_api_image(
-            image_file, trim_left_ratio=0.0, include_trim_ratio=True
-        )
+        base64_image = self._prepare_api_image(image_file)
 
         system_prompt = (
             "You analyse Uma Musume primary gameplay captures to find clickable UI elements. "
@@ -455,41 +465,82 @@ class MenuAnalyzer:
             ],
         }
 
-        try:
-            model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
-            request_body = {
-                "model": model_name,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    payload,
-                ],
-                "response_format": {"type": "json_object"},
-                "reasoning": {"enabled": False},  # No reasoning is recommended by Google
-            }
+        # Try up to 2 times if parse fails
+        parse_retry_allowed = True
+        content = None
 
-            self._logger.info(
-                "Calling OpenRouter primary vision model %s for %s", model_name, image_file.name
+        while True:
+            buttons: list[dict] = []
+            parse_ok = False
+            try:
+                model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
+                request_body = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        payload,
+                    ],
+                    "response_format": {"type": "json_object"},
+                    "reasoning": {"enabled": False},  # No reasoning is recommended by Google
+                }
+
+                self._logger.info(
+                    "Calling OpenRouter primary vision model %s for %s", model_name, image_file.name
+                )
+                response = requests.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=self._headers,
+                    json=request_body,
+                    timeout=60,
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                content = self._extract_response_content(response_data)
+                if content is not None:
+                    buttons, parse_ok = self._parse_buttons_payload(
+                        content, return_status=True
+                    )
+            except Exception as exc:  # pragma: no cover - network failure path
+                self._logger.error(
+                    "Error querying OpenRouter primary vision for %s: %s\n"
+                    "System prompt: %s\n"
+                    "User instructions: %s",
+                    image_file.name,
+                    exc,
+                    system_prompt,
+                    user_instructions,
+                )
+                # Try to log response if we got one
+                try:
+                    if 'response' in locals():
+                        self._logger.error("Response status: %d, content: %s", response.status_code, response.text[:500])
+                except Exception:
+                    pass
+                return []
+
+            if parse_ok:
+                if not buttons:
+                    self._logger.info("Primary vision parsed successfully but returned no buttons for %s", image_file.name)
+                return buttons
+
+            if parse_retry_allowed:
+                parse_retry_allowed = False
+                self._logger.warning(
+                    "Primary vision returned invalid JSON for %s; retrying once\n"
+                    "Response content: %s",
+                    image_file.name,
+                    content[:500] if content else "(no content)",
+                )
+                continue
+
+            # Parse failed twice; give up
+            self._logger.error(
+                "Primary vision failed to parse JSON after 2 attempts for %s\n"
+                "Last response: %s",
+                image_file.name,
+                content[:500] if content else "(no content)",
             )
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=self._headers,
-                json=request_body,
-                timeout=60,
-            )
-            response.raise_for_status()
-            response_data = response.json()
-        except Exception as exc:  # pragma: no cover - network failure path
-            self._logger.error("Error querying OpenRouter: %s", exc)
             return []
-
-        content = self._extract_response_content(response_data)
-        if content is None:
-            return []
-
-        buttons, parse_ok = self._parse_buttons_payload(
-            content, return_status=True
-        )
-        return buttons if parse_ok else []
 
     def detect_primary_scrollbar(self, primary_image: Image.Image) -> Optional[ScrollbarInfo]:
         """Heuristically detect a vertical scrollbar within a primary capture."""
@@ -530,7 +581,8 @@ class MenuAnalyzer:
                     continue
 
                 global_left = width - band_width + left_edge
-                if global_left < width - self.SCROLLBAR_SEARCH_WIDTH:
+                search_width = min(self.SCROLLBAR_SEARCH_WIDTH, band_width)
+                if global_left < width - search_width:
                     continue
 
                 edge_strength = float(mean_grad[left_edge] + mean_grad[right_edge - 1])
@@ -594,37 +646,13 @@ class MenuAnalyzer:
             thumb_ratio=thumb_ratio,
         )
 
-    def _prepare_api_image(
-        self,
-        image_file: Path,
-        trim_left_ratio: float = 0.0,
-        *,
-        include_trim_ratio: bool = False,
-    ) -> Any:
-        """Load, trim, and encode the image region sent to the VLM."""
-
+    def _prepare_api_image(self, image_file: Path) -> str:
+        """Load and encode the image for VLM API calls."""
         with Image.open(image_file) as image:
-            trimmed, actual_ratio = self._trim_left_region(image, trim_left_ratio)
             with BytesIO() as buffer:
-                trimmed.save(buffer, format="PNG")
+                image.save(buffer, format="PNG")
                 encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return (encoded, actual_ratio) if include_trim_ratio else encoded
-
-    def _trim_left_region(self, image: Image.Image, trim_left_ratio: float) -> Tuple[Image.Image, float]:
-        """Remove a fixed-width strip before querying the VLM."""
-
-        width, height = image.size
-        if width <= 0 or height <= 0:
-            return image.copy(), 0.0
-
-        clamp_ratio = max(0.0, min(trim_left_ratio, 1.0))
-        trim_px = int(round(width * clamp_ratio))
-        if trim_px >= width:
-            trim_px = max(0, width - 1)
-
-        actual_ratio = (trim_px / width) if width else 0.0
-        cropped = image.crop((trim_px, 0, width, height))
-        return cropped.copy(), actual_ratio
+        return encoded
 
     def _largest_segment(self, mask: np.ndarray, min_length: int) -> Optional[tuple[int, int]]:
         """Return the longest contiguous True segment meeting the minimum length."""
@@ -663,7 +691,7 @@ class MenuAnalyzer:
         self._api_key = api_key
         self._headers = {
             "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "https://github.com/LLuMaMusume/LLuMaMusume",
+            "HTTP-Referer": "https://github.com/nichosta/LLuMaMusume",
             "X-Title": "LLuMa Musume Agent",
             "Content-Type": "application/json",
         }
