@@ -337,12 +337,12 @@ class MenuAnalyzer:
             ],
         }
 
-        # Try up to 2 times if parse fails
-        parse_retry_allowed = True
+        # Allow up to 3 total attempts (1 initial + 2 retries)
+        max_attempts = 3
         content = None
 
-        while True:
-            buttons: list[dict] = []
+        for attempt in range(max_attempts):
+            buttons: list[dict] = []  # type: ignore
             parse_ok = False
             try:
                 model_name = "google/gemini-2.5-flash-lite-preview-09-2025"
@@ -393,28 +393,42 @@ class MenuAnalyzer:
                 return []
 
             if parse_ok:
-                if not buttons:
-                    self._logger.info("Menus vision parsed successfully but returned no buttons for %s", image_file.name)
-                return buttons
+                # If we have buttons, we're done
+                if buttons:
+                    return buttons
 
-            if parse_retry_allowed:
-                parse_retry_allowed = False
+                # If we have no buttons but more attempts left, log and retry
+                if attempt < max_attempts - 1:
+                    self._logger.warning(
+                        "Menus vision returned empty list for %s; retrying (attempt %d/%d)",
+                        image_file.name,
+                        attempt + 2,
+                        max_attempts,
+                    )
+                    continue
+                else:
+                    self._logger.info("Menus vision returned no buttons for %s after %d attempts", image_file.name, max_attempts)
+                    return []
+
+            # If parsing failed but we have more attempts left, log and retry
+            if attempt < max_attempts - 1:
                 self._logger.warning(
-                    "Menus vision returned invalid JSON for %s; retrying once\n"
+                    "Menus vision returned invalid JSON for %s; retrying (attempt %d/%d)\n"
                     "Response content: %s",
                     image_file.name,
+                    attempt + 2,
+                    max_attempts,
                     content[:500] if content else "(no content)",
                 )
                 continue
 
-            # Parse failed twice; give up
-            self._logger.error(
-                "Menus vision failed to parse JSON after 2 attempts for %s\n"
-                "Last response: %s",
-                image_file.name,
-                content[:500] if content else "(no content)",
-            )
-            return []
+        # This part is reached after all attempts fail to parse
+        self._logger.error(
+            "Menus vision failed to parse JSON after %d attempts for %s",
+            max_attempts,
+            image_file.name,
+        )
+        return []
 
     def get_primary_elements(self, image_path: str) -> list[dict]:
         """Detect primary-region buttons via the VLM with retry logic."""
