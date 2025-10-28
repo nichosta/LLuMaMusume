@@ -74,7 +74,8 @@ class UmaAgent:
         self._memory = memory_manager
         self._logger = logger or logging.getLogger(__name__)
         self._client: Optional[Anthropic] = None
-        self._turn_history: List[str] = []
+        self._message_history: List[Dict[str, Any]] = []  # Full message history for API
+        self._turn_summaries: List[str] = []  # Human-readable summaries for logging
         self._model = model
         self._max_context_tokens = max_context_tokens
         self._thinking_enabled = thinking_enabled
@@ -108,7 +109,7 @@ class UmaAgent:
         timestamp = datetime.now().isoformat()
         self._logger.info("Starting turn %s", turn_id)
 
-        # Build context message
+        # Build context message (without turn history - that's in message_history now)
         user_message = self._format_context(turn_id, timestamp, vision_data)
 
         # Add screenshots (Anthropic format)
@@ -120,7 +121,10 @@ class UmaAgent:
         if menus_screenshot is not None and menus_screenshot.exists():
             message_content.append(self._encode_image(menus_screenshot))
 
-        # Call LLM
+        # Add user message to history
+        self._message_history.append({"role": "user", "content": message_content})
+
+        # Call LLM with full message history
         try:
             # Build thinking config
             thinking_config = None
@@ -130,12 +134,13 @@ class UmaAgent:
                     "budget_tokens": self._thinking_budget_tokens,
                 }
 
-            self._logger.info("Calling Anthropic model %s for turn %s", self._model, turn_id)
+            self._logger.info("Calling Anthropic model %s for turn %s (history: %d messages)",
+                            self._model, turn_id, len(self._message_history))
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=AGENT_SYSTEM_PROMPT,
-                messages=[{"role": "user", "content": message_content}],
+                messages=self._message_history,
                 tools=ALL_TOOLS,
                 thinking=thinking_config,
             )
@@ -149,11 +154,28 @@ class UmaAgent:
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
 
-        # Record turn in history (for context window management)
+        # Store assistant response in message history (preserves thinking blocks)
+        assistant_content = []
+        for block in response.content:
+            if block.type == "thinking":
+                assistant_content.append({"type": "thinking", "thinking": block.thinking})
+            elif block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                assistant_content.append({
+                    "type": "tool_use",
+                    "id": block.id,
+                    "name": block.name,
+                    "input": block.input,
+                })
+        self._message_history.append({"role": "assistant", "content": assistant_content})
+
+        # Create human-readable summary for logging
         turn_summary = self._format_turn_summary(turn_id, reasoning, memory_actions, input_action)
-        self._turn_history.append(turn_summary)
+        self._turn_summaries.append(turn_summary)
 
         # TODO: Implement context summarization when history exceeds max_context_tokens
+        # (prune old messages from _message_history)
 
         return TurnResult(
             turn_id=turn_id,
@@ -168,20 +190,13 @@ class UmaAgent:
     def _format_context(self, turn_id: str, timestamp: str, vision_data: VisionData) -> str:
         """Format the context message for the LLM.
 
-        Combines turn metadata, turn history, vision data, and memory files.
+        Combines turn metadata, vision data, and memory files.
+        Note: Turn history is now passed via the messages array, not embedded in text.
         """
         sections = []
 
         # Turn metadata
         sections.append(f"# Turn {turn_id}\n\nTimestamp: {timestamp}\n")
-
-        # Turn history (recent reasoning and actions)
-        if self._turn_history:
-            sections.append("# Previous Turns\n")
-            # Show last 5 turns (TODO: implement proper summarization)
-            recent = self._turn_history[-5:]
-            sections.append("\n".join(recent))
-            sections.append("")
 
         # Vision data (JSON)
         vision_json = {
