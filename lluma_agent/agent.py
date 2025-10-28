@@ -11,7 +11,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import requests
+from anthropic import Anthropic
 from PIL import Image
 
 from .memory import MemoryManager, MemoryError
@@ -40,6 +40,7 @@ class TurnResult:
 
     turn_id: str
     reasoning: str
+    thinking: Optional[str]  # Extended thinking content (if enabled)
     memory_actions: List[Dict[str, Any]]
     input_action: Optional[Dict[str, Any]]
     execution_results: List[str]
@@ -52,28 +53,35 @@ class UmaAgent:
     def __init__(
         self,
         memory_manager: MemoryManager,
-        # model: str = "google/gemini-flash-2.5-latest",
-        model: str = "anthropic/claude-haiku-4.5",
+        model: str = "claude-haiku-4-5",
         max_context_tokens: int = 32000,
+        thinking_enabled: bool = True,
+        thinking_budget_tokens: int = 16000,
+        max_tokens: int = 4096,
         logger: Optional[Logger] = None,
     ) -> None:
         """Initialize the agent.
 
         Args:
             memory_manager: Memory file manager instance
-            model: LLM model identifier for OpenRouter
+            model: Anthropic model identifier (e.g., "claude-haiku-4-5")
             max_context_tokens: Maximum context window size for turn history
+            thinking_enabled: Whether to enable extended thinking
+            thinking_budget_tokens: Max tokens for internal reasoning (min 1024, recommended 16000+)
+            max_tokens: Maximum tokens for response (must exceed thinking_budget_tokens)
             logger: Optional logger instance
         """
         self._memory = memory_manager
         self._logger = logger or logging.getLogger(__name__)
-        self._api_key: str = ""
-        self._headers: Dict[str, str] = {}
+        self._client: Optional[Anthropic] = None
         self._turn_history: List[str] = []
         self._model = model
         self._max_context_tokens = max_context_tokens
+        self._thinking_enabled = thinking_enabled
+        self._thinking_budget_tokens = thinking_budget_tokens
+        self._max_tokens = max_tokens
 
-        # Initialize OpenRouter API configuration
+        # Initialize Anthropic API client
         self._init_api()
 
     def execute_turn(
@@ -103,50 +111,40 @@ class UmaAgent:
         # Build context message
         user_message = self._format_context(turn_id, timestamp, vision_data)
 
-        # Add screenshots
-        message_content = [
+        # Add screenshots (Anthropic format)
+        message_content: List[Dict[str, Any]] = [
             {"type": "text", "text": user_message},
-            {
-                "type": "image_url",
-                "image_url": {"url": self._encode_image(primary_screenshot)},
-            },
+            self._encode_image(primary_screenshot),
         ]
 
         if menus_screenshot is not None and menus_screenshot.exists():
-            message_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._encode_image(menus_screenshot)},
-                }
-            )
+            message_content.append(self._encode_image(menus_screenshot))
 
         # Call LLM
         try:
-            payload = {
-                "model": self._model,
-                "messages": [
-                    {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-                    {"role": "user", "content": message_content},
-                ],
-                "tools": ALL_TOOLS,
-                "tool_choice": "auto",
-            }
+            # Build thinking config
+            thinking_config = None
+            if self._thinking_enabled:
+                thinking_config = {
+                    "type": "enabled",
+                    "budget_tokens": self._thinking_budget_tokens,
+                }
 
-            self._logger.info("Calling OpenRouter agent model %s for turn %s", self._model, turn_id)
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=self._headers,
-                json=payload,
-                timeout=60,
+            self._logger.info("Calling Anthropic model %s for turn %s", self._model, turn_id)
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=AGENT_SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": message_content}],
+                tools=ALL_TOOLS,
+                thinking=thinking_config,
             )
-            response.raise_for_status()
-            response_data = response.json()
         except Exception as exc:
             raise AgentError(f"LLM request failed: {exc}") from exc
 
         # Extract reasoning and tool calls
-        reasoning = self._extract_reasoning(response_data)
-        tool_calls = self._extract_tool_calls(response_data)
+        reasoning, thinking = self._extract_reasoning(response)
+        tool_calls = self._extract_tool_calls(response)
 
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
@@ -160,6 +158,7 @@ class UmaAgent:
         return TurnResult(
             turn_id=turn_id,
             reasoning=reasoning,
+            thinking=thinking,
             memory_actions=memory_actions,
             input_action=input_action,
             execution_results=execution_results,
@@ -280,92 +279,87 @@ class UmaAgent:
             raise AgentError(f"Unknown memory tool: {name}")
 
     def _init_api(self) -> None:
-        """Initialize OpenRouter API configuration."""
-        api_key = os.environ.get("OPENROUTER_API_KEY")
+        """Initialize Anthropic API client."""
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
         if not api_key:
-            raise ValueError("OPENROUTER_API_KEY environment variable not set")
+            raise ValueError("ANTHROPIC_API_KEY environment variable not set")
 
-        self._api_key = api_key
-        self._headers = {
-            "Authorization": f"Bearer {api_key}",
-            "HTTP-Referer": "https://github.com/nichosta/LLuMaMusume",
-            "X-Title": "LLuMa Musume Agent",
-            "Content-Type": "application/json",
-        }
-        self._logger.info("Initialized OpenRouter API with model: %s", self._model)
+        self._client = Anthropic(api_key=api_key)
+        thinking_status = "enabled" if self._thinking_enabled else "disabled"
+        self._logger.info(
+            "Initialized Anthropic API with model: %s (thinking: %s, budget: %d tokens)",
+            self._model,
+            thinking_status,
+            self._thinking_budget_tokens,
+        )
 
-    def _encode_image(self, image_path: Path) -> str:
-        """Encode image to base64 data URL.
+    def _encode_image(self, image_path: Path) -> Dict[str, Any]:
+        """Encode image to Anthropic's image format.
 
         Args:
             image_path: Path to image file
 
         Returns:
-            Data URL string
+            Image content dict with type, source, and media_type
         """
         with Image.open(image_path) as img:
             with BytesIO() as buffer:
                 img.save(buffer, format="PNG")
                 b64 = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                return f"data:image/png;base64,{b64}"
+                return {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": b64,
+                    },
+                }
 
-    def _extract_reasoning(self, response: Dict[str, Any]) -> str:
-        """Extract reasoning text from LLM response.
+    def _extract_reasoning(self, response: Any) -> tuple[str, Optional[str]]:
+        """Extract reasoning text and thinking blocks from Anthropic response.
 
         Args:
-            response: OpenRouter API response dict
+            response: Anthropic Message object
 
         Returns:
-            Reasoning text
+            Tuple of (reasoning_text, thinking_text)
         """
         try:
-            message = response["choices"][0]["message"]
-            content = message.get("content")
-            return content.strip() if content else "(No reasoning provided)"
+            reasoning_parts = []
+            thinking_parts = []
+
+            for block in response.content:
+                if block.type == "text":
+                    reasoning_parts.append(block.text)
+                elif block.type == "thinking":
+                    thinking_parts.append(block.thinking)
+                    self._logger.debug("Extended thinking: %s", block.thinking[:200] + "...")
+
+            reasoning = "\n".join(reasoning_parts).strip() if reasoning_parts else "(No reasoning provided)"
+            thinking = "\n".join(thinking_parts).strip() if thinking_parts else None
+
+            return reasoning, thinking
         except Exception as exc:
             self._logger.warning("Failed to extract reasoning: %s", exc)
-            return "(Failed to extract reasoning)"
+            return "(Failed to extract reasoning)", None
 
-    def _extract_tool_calls(self, response: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Extract tool calls from LLM response.
+    def _extract_tool_calls(self, response: Any) -> List[Dict[str, Any]]:
+        """Extract tool calls from Anthropic response.
 
         Args:
-            response: OpenRouter API response dict
+            response: Anthropic Message object
 
         Returns:
             List of tool call dictionaries with 'name' and 'arguments' keys
         """
         try:
-            message = response["choices"][0]["message"]
-            tool_calls = message.get("tool_calls")
-            if not tool_calls:
-                return []
-
             calls = []
-            for tc in tool_calls:
-                function = tc["function"]
-                name = function["name"]
-                raw_arguments = function.get("arguments", "")
-
-                if raw_arguments is None:
-                    arguments = {}
-                elif isinstance(raw_arguments, str):
-                    args_str = raw_arguments.strip()
-                    if args_str:
-                        try:
-                            arguments = json.loads(args_str)
-                        except json.JSONDecodeError:
-                            self._logger.warning("Failed to parse tool arguments for %s: %s", name, args_str)
-                            arguments = {}
-                    else:
-                        arguments = {}
-                elif isinstance(raw_arguments, dict):
-                    arguments = raw_arguments
-                else:
-                    self._logger.warning("Unexpected arguments payload for %s: %r", name, raw_arguments)
-                    arguments = {}
-
-                calls.append({"name": name, "arguments": arguments})
+            for block in response.content:
+                if block.type == "tool_use":
+                    calls.append({
+                        "name": block.name,
+                        "arguments": block.input,
+                    })
 
             return calls
 

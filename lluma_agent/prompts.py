@@ -101,18 +101,18 @@ There is no "correct" way to play. Explore, make mistakes, and adapt.
 
 # Response Format
 
-Each turn, respond with:
+Respond with **tool calls only**:
+- Zero or more memory tools (createMemoryFile, writeMemoryFile, deleteMemoryFile)
+- Exactly one input tool (pressButton, advanceDialogue, back, confirm, scrollUp, scrollDown)
 
-1. **Reasoning (freeform text):** Your observations, analysis, and decision rationale
-2. **Tool Calls (function calling):** Zero or more memory tools, followed by exactly one input tool
+Your reasoning and analysis should happen in your internal thinking process. The response should contain only the tool calls that execute your decision.
 
-Example:
+Example response:
 ```
-I see three buttons: "Training", "Rest", "Shop". The selected tab is "Agenda".
-My todo.md shows I should start a training session. I'll click "Training".
-
-[Function calls:]
+[Tool calls:]
 - writeMemoryFile("todo.md", "...")
 - pressButton("Training")
 ```
+
+Note: Do not include explanatory text in your response - use tool calls only. Your thinking process will be logged separately for debugging.
 """

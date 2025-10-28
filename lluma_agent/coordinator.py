@@ -166,6 +166,9 @@ class GameLoopCoordinator:
             self._memory,
             model=agent_config.model,
             max_context_tokens=agent_config.max_context_tokens,
+            thinking_enabled=agent_config.thinking_enabled,
+            thinking_budget_tokens=agent_config.thinking_budget_tokens,
+            max_tokens=agent_config.max_tokens,
             logger=self._logger,
         )
         self._input_handler = InputHandler(
@@ -265,6 +268,7 @@ class GameLoopCoordinator:
             )
             turn_log["agent"] = {
                 "reasoning": turn_result.reasoning,
+                "thinking": turn_result.thinking,
                 "memory_actions": [
                     {"name": a["name"], "args_keys": list(a["arguments"].keys())}
                     for a in turn_result.memory_actions
