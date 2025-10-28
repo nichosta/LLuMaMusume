@@ -171,7 +171,18 @@ Optional packages (`opencv-python-headless`, `scikit-image`, `ImageHash`, `pytes
 
 # Agent
 
-The reasoning agent lives in `lluma_agent`. It currently calls OpenRouter’s `anthropic/claude-haiku-4.5` model (configurable via `agent.model`). Vision continues to use Gemini 2.5 Flash-Lite; the agent model can be changed independently in `config.yaml`.
+The reasoning agent lives in `lluma_agent`. It uses the Anthropic API with extended thinking enabled by default. The default model is `claude-haiku-4-5` (configurable via `agent.model`). Vision continues to use Gemini 2.5 Flash-Lite via OpenRouter; the agent model can be changed independently in `config.yaml`.
+
+## Extended Thinking
+
+The agent uses Claude's extended thinking capability to improve reasoning quality for complex gameplay decisions. Extended thinking allows the model to show its step-by-step reasoning process before producing final responses. Key features:
+
+- **Thinking budget**: Configurable via `agent.thinking_budget_tokens` (default: 16000, minimum: 1024)
+- **Transparency**: Thinking blocks are logged separately in turn logs for debugging
+- **Toggle**: Can be disabled via `agent.thinking_enabled: false` in config.yaml
+- **Supported models**: Haiku 4.5, Sonnet 4.5, Sonnet 4, Sonnet 3.7, Opus 4.1, Opus 4
+
+The thinking process is visible in debug logs and saved in per-turn JSON logs under the `thinking` field.
 
 ## Tools
 
@@ -220,7 +231,7 @@ Memory file naming:
 Turn structure and timing
 - Each turn performs: ensure window (reposition only on the first turn) → capture → vision processing → agent reasoning → execute at most one input → persist the turn log → sleep for `agent.turn_post_padding_s` seconds (default 5s).
 - Turn latency: Highly variable by model/load; budget ~10–30s. Add a fixed 5s padding between turns to smooth variance.
-- Timeouts: The OpenRouter call currently uses a 60s HTTP timeout via `requests.post`. Failures raise `AgentError` for the turn and no input is issued.
+- Timeouts: The Anthropic API call uses the SDK's default timeout. Failures raise `AgentError` for the turn and no input is issued.
 - Vision prompts (menus + primary) run sequentially inside `MenuAnalyzer`; there is no parallelism at present.
 
 Context and summarization
@@ -257,10 +268,13 @@ Capture
 - `retention.max_captures`: 200 raw captures (associated primary/menus/tabs files follow the raw capture’s lifecycle).
 
 Agent
-- `model`: defaults to `anthropic/claude-haiku-4.5`.
+- `model`: defaults to `claude-haiku-4-5`. Use Anthropic model identifiers (e.g., `claude-sonnet-4-5`, `claude-opus-4-1`).
 - `memory_dir`, `logs_dir`: directories for scratchpad files and per-turn logs (`memory/`, `logs/`).
 - `max_memory_tokens`, `max_context_tokens`: both default to 32 000.
-- `request_timeout_s`: accepted but not yet wired through—the HTTP requests currently use a fixed 60 s timeout.
+- `thinking_enabled`: enable extended thinking (default `true`).
+- `thinking_budget_tokens`: max tokens for internal reasoning (default 16 000, minimum 1 024).
+- `max_tokens`: max output tokens (default 4 096, must exceed thinking_budget_tokens).
+- `request_timeout_s`: reserved for future use; the Anthropic SDK manages timeouts internally.
 - `turn_post_padding_s`: sleep between turns (default 5 s).
 - `allow_skip_cinematics`: reserved for future cinematic handling; no runtime logic reads it yet.
 
@@ -321,7 +335,7 @@ Install Python 3.13.8 (x64), then install dependencies via `uv pip install -r re
   - Image processing extras: `opencv-python-headless`, `scikit-image`, `ImageHash`, `pytesseract`
 
 Environment
-- Set `OPENROUTER_API_KEY` in the environment for Vision and Agent calls.
+- Set `ANTHROPIC_API_KEY` in the environment for Agent calls and `OPENROUTER_API_KEY` for Vision calls.
 - Ensure Steam window title is exactly `Umamusume`.
 - First-run checklist: Ensure the game window is open and visible (position/size don't matter), confirm capture works, adjust split ratios as needed. Optionally configure `window.placement` in config.yaml for auto-positioning at startup.
 

@@ -87,7 +87,7 @@ class CaptureConfig:
 class AgentConfig:
     """Agent and LLM configuration."""
 
-    model: str = "anthropic/claude-haiku-4.5"
+    model: str = "claude-haiku-4-5"
     memory_dir: Path = Path("memory")
     logs_dir: Path = Path("logs")
     max_memory_tokens: int = 32000
@@ -95,6 +95,10 @@ class AgentConfig:
     request_timeout_s: int = 30
     turn_post_padding_s: float = 5.0
     allow_skip_cinematics: bool = False
+    thinking_enabled: bool = True
+    thinking_budget_tokens: int = 12000
+    max_tokens: int = 16000
+    max_history_messages: int = 20  # Max messages in conversation history (0 = unlimited)
 
 
 def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
@@ -240,6 +244,18 @@ def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
 
     if "allow_skip_cinematics" in data:
         config.allow_skip_cinematics = bool(data["allow_skip_cinematics"])
+
+    if "thinking_enabled" in data:
+        config.thinking_enabled = bool(data["thinking_enabled"])
+
+    if "thinking_budget_tokens" in data:
+        config.thinking_budget_tokens = int(data["thinking_budget_tokens"])
+
+    if "max_tokens" in data:
+        config.max_tokens = int(data["max_tokens"])
+
+    if "max_history_messages" in data:
+        config.max_history_messages = int(data["max_history_messages"])
 
 
 __all__ = [

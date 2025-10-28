@@ -6,6 +6,7 @@ numpy
 requests
 pyyaml
 pytest
+anthropic
 
 # Optional (uncomment as needed)
 # keyboard

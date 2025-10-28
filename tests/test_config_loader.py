@@ -12,7 +12,7 @@ class LoadConfigsTest(unittest.TestCase):
         self.assertIsNone(window_cfg.placement)  # Placement is optional, defaults to None
         self.assertEqual(capture_cfg.output_dir, Path("captures"))
         self.assertEqual(capture_cfg.scaling_factor, window_cfg.scaling_factor)
-        self.assertEqual(agent_cfg.model, "anthropic/claude-haiku-4.5")
+        self.assertEqual(agent_cfg.model, "claude-haiku-4-5")
 
     def test_overrides_apply(self) -> None:
         yaml_content = """

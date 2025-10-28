@@ -14,3 +14,16 @@ capture:
     primary_ratio: 0.42126     # Primary gameplay area
     menus_ratio: 0.41497       # Menu/UI area
     tabs_ratio: 0.08503        # Right-side tabs (clipped to separate image)
+
+# Agent configuration (Anthropic API)
+agent:
+  model: "claude-haiku-4-5"              # Anthropic model (haiku-4-5, sonnet-4-5, opus-4-1, etc.)
+  memory_dir: "memory"                   # Scratchpad directory
+  logs_dir: "logs"                       # Per-turn logs directory
+  max_memory_tokens: 32000               # Total token budget for scratchpad
+  max_context_tokens: 32000              # Turn history context window
+  turn_post_padding_s: 5.0               # Sleep between turns
+  thinking_enabled: true                 # Enable Claude's extended thinking
+  thinking_budget_tokens: 12000          # Max tokens for internal reasoning (min 1024)
+  max_tokens: 16000                      # Max output tokens (must exceed thinking_budget_tokens)
+  max_history_messages: 20               # Max messages in conversation history (0 = unlimited)
