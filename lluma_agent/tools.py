@@ -1,5 +1,33 @@
-"""Tool definitions and schemas for OpenAI function calling."""
+"""Tool definitions and schemas for Anthropic tool use."""
 from typing import Any, Dict, List
+
+
+def _convert_to_anthropic_format(openai_tool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert OpenAI/OpenRouter tool format to Anthropic format.
+
+    OpenAI format:
+    {
+        "type": "function",
+        "function": {
+            "name": "...",
+            "description": "...",
+            "parameters": {...}
+        }
+    }
+
+    Anthropic format:
+    {
+        "name": "...",
+        "description": "...",
+        "input_schema": {...}
+    }
+    """
+    func = openai_tool["function"]
+    return {
+        "name": func["name"],
+        "description": func["description"],
+        "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+    }
 
 # Memory management tools
 TOOL_CREATE_MEMORY_FILE = {
@@ -139,14 +167,14 @@ TOOL_SCROLL_DOWN = {
     },
 }
 
-# Tool collections
-MEMORY_TOOLS = [
+# Tool collections (OpenAI/OpenRouter format)
+_MEMORY_TOOLS_OPENAI = [
     TOOL_CREATE_MEMORY_FILE,
     TOOL_WRITE_MEMORY_FILE,
     TOOL_DELETE_MEMORY_FILE,
 ]
 
-INPUT_TOOLS = [
+_INPUT_TOOLS_OPENAI = [
     TOOL_PRESS_BUTTON,
     TOOL_ADVANCE_DIALOGUE,
     TOOL_BACK,
@@ -155,6 +183,11 @@ INPUT_TOOLS = [
     TOOL_SCROLL_DOWN,
 ]
 
+_ALL_TOOLS_OPENAI = _MEMORY_TOOLS_OPENAI + _INPUT_TOOLS_OPENAI
+
+# Tool collections (Anthropic format) - for agent use
+MEMORY_TOOLS = [_convert_to_anthropic_format(t) for t in _MEMORY_TOOLS_OPENAI]
+INPUT_TOOLS = [_convert_to_anthropic_format(t) for t in _INPUT_TOOLS_OPENAI]
 ALL_TOOLS = MEMORY_TOOLS + INPUT_TOOLS
 
 # Tool name sets for validation
@@ -175,19 +208,19 @@ INPUT_TOOL_NAMES = {
 
 
 def get_tool_by_name(name: str) -> Dict[str, Any]:
-    """Get tool schema by name.
+    """Get tool schema by name (Anthropic format).
 
     Args:
         name: Tool function name
 
     Returns:
-        Tool schema dictionary
+        Tool schema dictionary (Anthropic format)
 
     Raises:
         ValueError: If tool name is not recognized
     """
     for tool in ALL_TOOLS:
-        if tool["function"]["name"] == name:
+        if tool["name"] == name:
             return tool
     raise ValueError(f"Unknown tool name: {name}")
 

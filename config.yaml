@@ -25,4 +25,5 @@ agent:
   turn_post_padding_s: 5.0               # Sleep between turns
   thinking_enabled: true                 # Enable Claude's extended thinking
   thinking_budget_tokens: 16000          # Max tokens for internal reasoning (min 1024)
-  max_tokens: 4096                       # Max output tokens (must exceed thinking_budget_tokens)
+  max_tokens: 20000                      # Max output tokens (must exceed thinking_budget_tokens)
+  max_history_messages: 20               # Max messages in conversation history (0 = unlimited)

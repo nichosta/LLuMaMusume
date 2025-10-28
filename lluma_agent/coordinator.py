@@ -169,6 +169,7 @@ class GameLoopCoordinator:
             thinking_enabled=agent_config.thinking_enabled,
             thinking_budget_tokens=agent_config.thinking_budget_tokens,
             max_tokens=agent_config.max_tokens,
+            max_history_messages=agent_config.max_history_messages,
             logger=self._logger,
         )
         self._input_handler = InputHandler(
@@ -275,6 +276,7 @@ class GameLoopCoordinator:
                 ],
                 "input_action": turn_result.input_action,
                 "execution_results": turn_result.execution_results,
+                "usage": turn_result.usage,
             }
 
             # Step 4: Execute input action

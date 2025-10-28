@@ -45,6 +45,7 @@ class TurnResult:
     input_action: Optional[Dict[str, Any]]
     execution_results: List[str]
     timestamp: str
+    usage: Optional[Dict[str, int]] = None  # Token usage stats from API
 
 
 class UmaAgent:
@@ -58,6 +59,7 @@ class UmaAgent:
         thinking_enabled: bool = True,
         thinking_budget_tokens: int = 16000,
         max_tokens: int = 4096,
+        max_history_messages: int = 20,
         logger: Optional[Logger] = None,
     ) -> None:
         """Initialize the agent.
@@ -69,6 +71,7 @@ class UmaAgent:
             thinking_enabled: Whether to enable extended thinking
             thinking_budget_tokens: Max tokens for internal reasoning (min 1024, recommended 16000+)
             max_tokens: Maximum tokens for response (must exceed thinking_budget_tokens)
+            max_history_messages: Maximum messages to keep in history (0 = unlimited)
             logger: Optional logger instance
         """
         self._memory = memory_manager
@@ -81,6 +84,7 @@ class UmaAgent:
         self._thinking_enabled = thinking_enabled
         self._thinking_budget_tokens = thinking_budget_tokens
         self._max_tokens = max_tokens
+        self._max_history_messages = max_history_messages
 
         # Initialize Anthropic API client
         self._init_api()
@@ -121,10 +125,13 @@ class UmaAgent:
         if menus_screenshot is not None and menus_screenshot.exists():
             message_content.append(self._encode_image(menus_screenshot))
 
-        # Add user message to history
-        self._message_history.append({"role": "user", "content": message_content})
+        # Build messages array for API call:
+        # - All historical messages (without images)
+        # - Current turn message (WITH images)
+        # This prevents image token accumulation while keeping current turn visual
+        messages_for_api = self._message_history + [{"role": "user", "content": message_content}]
 
-        # Call LLM with full message history
+        # Call LLM
         try:
             # Build thinking config
             thinking_config = None
@@ -135,47 +142,93 @@ class UmaAgent:
                 }
 
             self._logger.info("Calling Anthropic model %s for turn %s (history: %d messages)",
-                            self._model, turn_id, len(self._message_history))
+                            self._model, turn_id, len(messages_for_api))
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
                 system=AGENT_SYSTEM_PROMPT,
-                messages=self._message_history,
+                messages=messages_for_api,
                 tools=ALL_TOOLS,
                 thinking=thinking_config,
             )
         except Exception as exc:
             raise AgentError(f"LLM request failed: {exc}") from exc
 
+        # Now store current user message in history WITHOUT images
+        message_content_for_history = [
+            block for block in message_content if block["type"] != "image"
+        ]
+        self._message_history.append({"role": "user", "content": message_content_for_history})
+
         # Extract reasoning and tool calls
         reasoning, thinking = self._extract_reasoning(response)
         tool_calls = self._extract_tool_calls(response)
+
+        # Extract token usage
+        usage = None
+        if hasattr(response, 'usage'):
+            usage = {
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            }
+            # Cache stats are optional
+            if hasattr(response.usage, 'cache_creation_input_tokens'):
+                usage["cache_creation_input_tokens"] = response.usage.cache_creation_input_tokens
+            if hasattr(response.usage, 'cache_read_input_tokens'):
+                usage["cache_read_input_tokens"] = response.usage.cache_read_input_tokens
+
+            self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
+                            turn_id, usage["input_tokens"], usage["output_tokens"])
 
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
 
         # Store assistant response in message history (preserves thinking blocks)
+        # IMPORTANT: Thinking blocks must be passed back UNMODIFIED per Anthropic docs
+        # Use model_dump() to preserve all fields including signature
         assistant_content = []
         for block in response.content:
-            if block.type == "thinking":
-                assistant_content.append({"type": "thinking", "thinking": block.thinking})
-            elif block.type == "text":
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+            # Convert Pydantic model to dict, preserving all fields
+            block_dict = block.model_dump()
+            assistant_content.append(block_dict)
         self._message_history.append({"role": "assistant", "content": assistant_content})
+
+        # If the assistant used tools, we must add a tool_result message immediately after
+        # This follows Anthropic's required conversation pattern for tool use
+        tool_result_content = []
+        for block in response.content:
+            if block.type == "tool_use":
+                # Create a success result for each tool
+                # The actual execution happens via input_handler, so we just acknowledge success
+                result_text = f"Tool {block.name} executed successfully."
+                if block.name in MEMORY_TOOL_NAMES:
+                    # Memory tools have actual results we can report
+                    matching_result = next(
+                        (r for r in execution_results if block.name in r),
+                        result_text
+                    )
+                    result_text = matching_result
+
+                tool_result_content.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": result_text,
+                })
+
+        # Add tool results message if any tools were used
+        if tool_result_content:
+            self._message_history.append({"role": "user", "content": tool_result_content})
 
         # Create human-readable summary for logging
         turn_summary = self._format_turn_summary(turn_id, reasoning, memory_actions, input_action)
         self._turn_summaries.append(turn_summary)
 
-        # TODO: Implement context summarization when history exceeds max_context_tokens
-        # (prune old messages from _message_history)
+        # Prune old messages if history exceeds limit
+        if self._max_history_messages > 0 and len(self._message_history) > self._max_history_messages:
+            excess = len(self._message_history) - self._max_history_messages
+            self._logger.info("Pruning %d old messages from history (keeping most recent %d)",
+                            excess, self._max_history_messages)
+            self._message_history = self._message_history[-self._max_history_messages:]
 
         return TurnResult(
             turn_id=turn_id,
@@ -185,6 +238,7 @@ class UmaAgent:
             input_action=input_action,
             execution_results=execution_results,
             timestamp=timestamp,
+            usage=usage,
         )
 
     def _format_context(self, turn_id: str, timestamp: str, vision_data: VisionData) -> str:

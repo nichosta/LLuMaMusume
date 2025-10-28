@@ -98,6 +98,7 @@ class AgentConfig:
     thinking_enabled: bool = True
     thinking_budget_tokens: int = 16000
     max_tokens: int = 4096
+    max_history_messages: int = 20  # Max messages in conversation history (0 = unlimited)
 
 
 def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
@@ -252,6 +253,9 @@ def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
 
     if "max_tokens" in data:
         config.max_tokens = int(data["max_tokens"])
+
+    if "max_history_messages" in data:
+        config.max_history_messages = int(data["max_history_messages"])
 
 
 __all__ = [
