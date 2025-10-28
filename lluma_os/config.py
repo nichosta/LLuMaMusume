@@ -96,8 +96,8 @@ class AgentConfig:
     turn_post_padding_s: float = 5.0
     allow_skip_cinematics: bool = False
     thinking_enabled: bool = True
-    thinking_budget_tokens: int = 16000
-    max_tokens: int = 4096
+    thinking_budget_tokens: int = 12000
+    max_tokens: int = 16000
     max_history_messages: int = 20  # Max messages in conversation history (0 = unlimited)
 
 
