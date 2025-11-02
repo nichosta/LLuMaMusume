@@ -236,9 +236,8 @@ Turn structure and timing
 
 Context and summarization
 - Historical turns are stored as compact summaries (~150 tokens vs ~8,500 for full context), dramatically reducing token accumulation.
-- Automatic summarization triggers when the message history size exceeds `agent.summarization_threshold_tokens` (default: 64,000 tokens).
-- Message history size is estimated using a simple heuristic (character count ÷ 4) to avoid sending oversized prompts to the API.
-- When triggered, the agent summarizes its entire history (game progress, UI knowledge, current state, discoveries).
+- Automatic summarization is queued for the next turn whenever the previous request's input token usage exceeds the smaller of `agent.summarization_threshold_tokens` and 90% of the configured context window.
+- When summarization runs, the agent summarizes its entire history (game progress, UI knowledge, current state, discoveries).
 - The message history is then replaced with a single synthetic summary message.
 - This prevents context overflow and allows indefinite session length.
 - Turn transcripts include the agent's reasoning, thinking blocks, and tool calls.
@@ -287,7 +286,7 @@ Agent
 - `thinking_enabled`: enable extended thinking (default `true`).
 - `thinking_budget_tokens`: max tokens for internal reasoning (default 16 000, minimum 1 024).
 - `max_tokens`: max output tokens (default 4 096, must exceed thinking_budget_tokens).
-- `summarization_threshold_tokens`: trigger automatic context summarization when message history size exceeds this (default 64 000, set to 0 to disable).
+- `summarization_threshold_tokens`: queue summarization for the next turn when the last prompt's input tokens exceed the smaller of this value and 90% of `max_context_tokens` (default 64 000, set to 0 to disable).
 - `request_timeout_s`: reserved for future use; the Anthropic SDK manages timeouts internally.
 - `turn_post_padding_s`: sleep between turns (default 5 s).
 - `allow_skip_cinematics`: reserved for future cinematic handling; no runtime logic reads it yet.

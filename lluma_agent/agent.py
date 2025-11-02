@@ -85,6 +85,8 @@ class UmaAgent:
         self._thinking_budget_tokens = thinking_budget_tokens
         self._max_tokens = max_tokens
         self._summarization_threshold_tokens = summarization_threshold_tokens
+        self._summarize_next_turn = False
+        self._last_input_tokens: Optional[int] = None
 
         # Initialize Anthropic API client
         self._init_api()
@@ -118,14 +120,15 @@ class UmaAgent:
         self._logger.info("Starting turn %s", turn_id)
 
         # Check if we need to summarize before executing this turn
-        estimated_prompt_tokens = self._estimate_prompt_size()
-        if self._should_summarize(estimated_prompt_tokens):
+        if self._summarization_threshold_tokens > 0 and self._summarize_next_turn:
+            last_tokens = self._last_input_tokens or 0
             self._logger.warning(
-                "Estimated prompt size (%d tokens) exceeded threshold (%d), triggering summarization",
-                estimated_prompt_tokens,
-                self._summarization_threshold_tokens
+                "Last prompt used %d input tokens (max context %d); running summarization before next turn",
+                last_tokens,
+                self._max_context_tokens,
             )
             self._perform_summarization()
+            self._summarize_next_turn = False
 
         # Build context message (without turn history - that's in message_history now)
         user_message = self._format_context(turn_id, timestamp, vision_data)
@@ -197,6 +200,10 @@ class UmaAgent:
 
             self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
                             turn_id, usage["input_tokens"], usage["output_tokens"])
+            self._last_input_tokens = usage["input_tokens"]
+            self._maybe_queue_summarization(usage["input_tokens"])
+        else:
+            self._last_input_tokens = None
 
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
@@ -566,45 +573,31 @@ class UmaAgent:
         lines.append("")
         return "\n".join(lines)
 
-    def _estimate_prompt_size(self) -> int:
-        """Estimate the size of the current message history in tokens.
-
-        Uses a simple heuristic: count characters and divide by 4 (rough approximation).
-
-        Returns:
-            Estimated token count for the message history
-        """
-        if not self._message_history:
-            return 0
-
-        # Count total characters in message history
-        total_chars = 0
-        for message in self._message_history:
-            content = message.get("content", [])
-            if isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and "text" in block:
-                        total_chars += len(block["text"])
-                    elif isinstance(block, dict) and "type" in block and block["type"] == "text":
-                        total_chars += len(block.get("text", ""))
-
-        # Rough approximation: 1 token ≈ 4 characters
-        estimated_tokens = total_chars // 4
-        return estimated_tokens
-
-    def _should_summarize(self, estimated_prompt_tokens: int) -> bool:
-        """Check if we should trigger summarization based on prompt size.
+    def _maybe_queue_summarization(self, input_tokens: int) -> None:
+        """Queue summarization for the next turn when prompt usage nears the limit.
 
         Args:
-            estimated_prompt_tokens: Estimated size of the current prompt in tokens
-
-        Returns:
-            True if estimated prompt size exceeds threshold
+            input_tokens: Token count for the most recent prompt sent to the model
         """
-        return (
-            self._summarization_threshold_tokens > 0
-            and estimated_prompt_tokens >= self._summarization_threshold_tokens
-        )
+        if self._summarization_threshold_tokens <= 0:
+            # Summarization disabled via config
+            return
+
+        ratio_threshold = int(self._max_context_tokens * 0.9)
+        trigger_tokens = min(self._summarization_threshold_tokens, ratio_threshold)
+        trigger_tokens = max(trigger_tokens, 1)
+
+        if input_tokens >= trigger_tokens:
+            self._summarize_next_turn = True
+            self._logger.warning(
+                "Input tokens %d exceeded summarization trigger %d (context max %d); "
+                "summarization queued for next turn",
+                input_tokens,
+                trigger_tokens,
+                self._max_context_tokens,
+            )
+        else:
+            self._summarize_next_turn = False
 
     def _perform_summarization(self) -> None:
         """Summarize the entire message history and replace it with a compact summary.
