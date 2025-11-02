@@ -98,6 +98,10 @@ class UmaAgent:
     ) -> TurnResult:
         """Execute a single turn: get LLM decision and execute tools.
 
+        Context optimization: The current turn receives full vision data + screenshots,
+        but when stored in message history, only a compact summary is kept (~150 tokens
+        vs ~8,500). This prevents exponential token growth while preserving continuity.
+
         Args:
             turn_id: Unique turn identifier
             vision_data: Structured vision detection results
@@ -154,11 +158,15 @@ class UmaAgent:
         except Exception as exc:
             raise AgentError(f"LLM request failed: {exc}") from exc
 
-        # Now store current user message in history WITHOUT images
-        message_content_for_history = [
-            block for block in message_content if block["type"] != "image"
-        ]
-        self._message_history.append({"role": "user", "content": message_content_for_history})
+        # Store compact turn summary in history (no images, no full vision JSON, no memory files)
+        # This dramatically reduces token accumulation in message history
+        compact_summary = self._format_compact_turn_context(turn_id, timestamp, vision_data)
+        self._logger.debug("Storing compact turn summary in history (~%d chars vs ~%d for full context)",
+                          len(compact_summary), len(user_message))
+        self._message_history.append({
+            "role": "user",
+            "content": [{"type": "text", "text": compact_summary}]
+        })
 
         # Extract reasoning and tool calls
         reasoning, thinking = self._extract_reasoning(response)
@@ -436,6 +444,77 @@ class UmaAgent:
             self._logger.warning("Failed to extract tool calls: %s", exc)
             return []
 
+    def _format_compact_turn_context(
+        self,
+        turn_id: str,
+        timestamp: str,
+        vision_data: VisionData,
+    ) -> str:
+        """Format a compact turn summary for message history (not current turn).
+
+        This creates a minimal text representation that preserves context continuity
+        without the full vision JSON overhead. Used when storing turns in history.
+
+        Example output:
+            # Turn turn_000005
+            Timestamp: 2025-11-01T18:15:22.123456
+
+            Buttons: Archive, Profile, Titles, Friends, Options, Info button, Back button
+            Menu: tab=Menu, available=['Jukebox', 'Menu']
+            Scrollbar: none
+
+        Args:
+            turn_id: Turn identifier
+            timestamp: Turn timestamp
+            vision_data: Vision data for the turn
+
+        Returns:
+            Compact text summary (~150-200 tokens vs ~8,500 for full format)
+        """
+        lines = [f"# Turn {turn_id}", f"Timestamp: {timestamp}", ""]
+
+        # Button names only (no bounds, metadata, or full labels)
+        button_names = [btn["name"] for btn in vision_data.buttons]
+        if button_names:
+            # Format as comma-separated list, breaking into multiple lines if very long
+            buttons_text = ", ".join(button_names)
+            if len(buttons_text) > 200:
+                # Break into chunks for readability
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                for name in button_names:
+                    if current_length + len(name) + 2 > 200 and current_chunk:
+                        chunks.append(", ".join(current_chunk))
+                        current_chunk = [name]
+                        current_length = len(name)
+                    else:
+                        current_chunk.append(name)
+                        current_length += len(name) + 2
+                if current_chunk:
+                    chunks.append(", ".join(current_chunk))
+                buttons_text = "\n  ".join(chunks)
+                lines.append(f"Buttons:\n  {buttons_text}")
+            else:
+                lines.append(f"Buttons: {buttons_text}")
+        else:
+            lines.append("Buttons: (none detected)")
+
+        # Menu state (minimal)
+        menu = vision_data.menu_state
+        if menu.get("selected_tab") or menu.get("available_tabs"):
+            tab = menu.get("selected_tab", "none")
+            available = menu.get("available_tabs", [])
+            lines.append(f"Menu: tab={tab}, available={available}")
+
+        # Scrollbar (yes/no only)
+        if vision_data.scrollbar:
+            lines.append("Scrollbar: present")
+        else:
+            lines.append("Scrollbar: none")
+
+        return "\n".join(lines)
+
     def _format_turn_summary(
         self,
         turn_id: str,
@@ -443,7 +522,7 @@ class UmaAgent:
         memory_actions: List[Dict[str, Any]],
         input_action: Optional[Dict[str, Any]],
     ) -> str:
-        """Format a compact summary of a turn for history.
+        """Format a compact summary of a turn for logging.
 
         Args:
             turn_id: Turn identifier

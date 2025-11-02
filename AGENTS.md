@@ -249,6 +249,15 @@ Safety and limits
 - One action per turn (strictly enforced). This may be increased after testing.
 - If Vision returns no actionable buttons for the turn, attempt one `advanceDialogue()` then end the turn with a diagnostic (no blind inputs).
 
+# Performance & Context Optimization
+
+See **CONTEXT.md** for detailed analysis of prompt structure, token usage patterns, and optimization strategies. This includes:
+- Token cost breakdown per turn
+- Button metadata optimization strategies
+- Historical turn trimming for reduced context accumulation
+- Prompt caching implementation
+- Cost projections and savings estimates
+
 # Configuration
 
 `config.yaml` (repo root) contains three sections: `window`, `capture`, and `agent`. All coordinates in this file are logical pixels.
