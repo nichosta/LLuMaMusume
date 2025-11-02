@@ -144,6 +144,10 @@ class GameLoopCoordinator:
         self._last_menu_tab: Optional[str] = None
         self._last_menu_buttons_raw: List[Dict[str, Any]] = []
 
+        # Cache for full vision objects (needed by input handler, not serialized in logs)
+        self._current_scrollbar_full: Optional[Any] = None  # ScrollbarInfo
+        self._current_menu_state_full: Optional[Any] = None  # MenuState
+
         # Ensure DPI awareness is set before any window operations
         set_dpi_aware()
 
@@ -310,6 +314,10 @@ class GameLoopCoordinator:
         Returns:
             VisionData for agent consumption
         """
+        # Clear cached full objects from previous turn
+        self._current_scrollbar_full = None
+        self._current_menu_state_full = None
+
         buttons = []
         scrollbar_info = None
         menu_state_dict: Dict[str, Any] = {
@@ -328,12 +336,13 @@ class GameLoopCoordinator:
                 capture_result.menus_image,
                 tabs_image=capture_result.tabs_image,
             )
+            # Store full menu state for input handler (not in VisionData to keep it JSON-serializable)
+            self._current_menu_state_full = menu_state
+
             # Compact format: just current tab and available tabs
             menu_state_dict = {
                 "tab": menu_state.selected_tab,
                 "available": menu_state.available_tabs(),
-                # Store full info for debugging/future use
-                "_full": menu_state,  # Temporary, for potential future needs
             }
 
             # Button detection in menus
@@ -393,9 +402,10 @@ class GameLoopCoordinator:
                     button_entry["_bounds"] = bounds  # Temporary, used by input handler setup
                     buttons.append(button_entry)
             else:
-                # Menu not usable; clear cache
+                # Menu not usable; clear caches
                 self._last_menu_tab = None
                 self._last_menu_buttons_raw = []
+                self._current_menu_state_full = None
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():
@@ -439,12 +449,13 @@ class GameLoopCoordinator:
             # Scrollbar detection (compact format for agent)
             scrollbar = self._vision.detect_primary_scrollbar(capture_result.primary_image)
             if scrollbar:
+                # Store full scrollbar for input handler (not in VisionData to keep it JSON-serializable)
+                self._current_scrollbar_full = scrollbar
+
                 # Compact format: only up/down booleans (agent doesn't need bounds/ratios)
                 scrollbar_info = {
                     "up": scrollbar.can_scroll_up,
                     "down": scrollbar.can_scroll_down,
-                    # Store full info for input handler
-                    "_full": scrollbar,  # Temporary, used by input handler setup
                 }
 
         return VisionData(
@@ -494,11 +505,11 @@ class GameLoopCoordinator:
             )
 
         scrollbar_for_handler = None
-        if vision_data.scrollbar and "_full" in vision_data.scrollbar:
+        if self._current_scrollbar_full is not None:
             from lluma_os.input_handler import ScrollbarInfo
 
-            # Extract full scrollbar info from _full field
-            full_scrollbar = vision_data.scrollbar["_full"]
+            # Use cached full scrollbar info
+            full_scrollbar = self._current_scrollbar_full
             scrollbar_for_handler = ScrollbarInfo(
                 track_bounds=tuple(full_scrollbar.track_bounds),  # type: ignore
                 thumb_bounds=tuple(full_scrollbar.thumb_bounds),  # type: ignore
