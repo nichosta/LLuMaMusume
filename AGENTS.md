@@ -235,9 +235,12 @@ Turn structure and timing
 - Vision prompts (menus + primary) run sequentially inside `MenuAnalyzer`; there is no parallelism at present.
 
 Context and summarization
-- The agent keeps a rolling list of compact turn summaries (last five entries) that get appended to the next prompt.
-- Automatic summarization/pruning based on `agent.max_context_tokens` is not implemented yet; it is a TODO item.
-- Turn transcripts already include the agent’s own reasoning plus any tool calls returned by OpenRouter.
+- Historical turns are stored as compact summaries (~150 tokens vs ~8,500 for full context), dramatically reducing token accumulation.
+- Automatic summarization is queued for the next turn whenever the previous request's input token usage exceeds the smaller of `agent.summarization_threshold_tokens` and 90% of the configured context window.
+- When summarization runs, the agent summarizes its entire history (game progress, UI knowledge, current state, discoveries).
+- The message history is then replaced with a single synthetic summary message.
+- This prevents context overflow and allows indefinite session length.
+- Turn transcripts include the agent's reasoning, thinking blocks, and tool calls.
 
 Memory scratchpad
 - The agent manages its scratchpad via `createMemoryFile(name)`, `deleteMemoryFile(name)`, `writeMemoryFile(name, content)`.
@@ -248,6 +251,15 @@ Memory scratchpad
 Safety and limits
 - One action per turn (strictly enforced). This may be increased after testing.
 - If Vision returns no actionable buttons for the turn, attempt one `advanceDialogue()` then end the turn with a diagnostic (no blind inputs).
+
+# Performance & Context Optimization
+
+See **CONTEXT.md** for detailed analysis of prompt structure, token usage patterns, and optimization strategies. This includes:
+- Token cost breakdown per turn
+- Button metadata optimization strategies
+- Historical turn trimming for reduced context accumulation
+- Prompt caching implementation
+- Cost projections and savings estimates
 
 # Configuration
 
@@ -274,6 +286,7 @@ Agent
 - `thinking_enabled`: enable extended thinking (default `true`).
 - `thinking_budget_tokens`: max tokens for internal reasoning (default 16 000, minimum 1 024).
 - `max_tokens`: max output tokens (default 4 096, must exceed thinking_budget_tokens).
+- `summarization_threshold_tokens`: queue summarization for the next turn when the last prompt's input tokens exceed the smaller of this value and 90% of `max_context_tokens` (default 64 000, set to 0 to disable).
 - `request_timeout_s`: reserved for future use; the Anthropic SDK manages timeouts internally.
 - `turn_post_padding_s`: sleep between turns (default 5 s).
 - `allow_skip_cinematics`: reserved for future cinematic handling; no runtime logic reads it yet.

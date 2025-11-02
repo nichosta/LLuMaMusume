@@ -26,4 +26,4 @@ agent:
   thinking_enabled: true                 # Enable Claude's extended thinking
   thinking_budget_tokens: 12000          # Max tokens for internal reasoning (min 1024)
   max_tokens: 16000                      # Max output tokens (must exceed thinking_budget_tokens)
-  max_history_messages: 20               # Max messages in conversation history (0 = unlimited)
+  summarization_threshold_tokens: 64000  # Trigger summarization when prompt size exceeds this (0 = disabled)

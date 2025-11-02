@@ -98,7 +98,7 @@ class AgentConfig:
     thinking_enabled: bool = True
     thinking_budget_tokens: int = 12000
     max_tokens: int = 16000
-    max_history_messages: int = 20  # Max messages in conversation history (0 = unlimited)
+    summarization_threshold_tokens: int = 64000  # Trigger summarization when message history size exceeds this (0 = disabled)
 
 
 def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
@@ -254,8 +254,8 @@ def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
     if "max_tokens" in data:
         config.max_tokens = int(data["max_tokens"])
 
-    if "max_history_messages" in data:
-        config.max_history_messages = int(data["max_history_messages"])
+    if "summarization_threshold_tokens" in data:
+        config.summarization_threshold_tokens = int(data["summarization_threshold_tokens"])
 
 
 __all__ = [

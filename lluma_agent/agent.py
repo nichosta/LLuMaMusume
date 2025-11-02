@@ -15,7 +15,7 @@ from anthropic import Anthropic
 from PIL import Image
 
 from .memory import MemoryManager, MemoryError
-from .prompts import AGENT_SYSTEM_PROMPT
+from .prompts import AGENT_SYSTEM_PROMPT, SUMMARIZATION_PROMPT
 from .tools import ALL_TOOLS, INPUT_TOOL_NAMES, MEMORY_TOOL_NAMES
 
 Logger = logging.Logger
@@ -59,7 +59,7 @@ class UmaAgent:
         thinking_enabled: bool = True,
         thinking_budget_tokens: int = 16000,
         max_tokens: int = 4096,
-        max_history_messages: int = 20,
+        summarization_threshold_tokens: int = 64000,
         logger: Optional[Logger] = None,
     ) -> None:
         """Initialize the agent.
@@ -71,7 +71,7 @@ class UmaAgent:
             thinking_enabled: Whether to enable extended thinking
             thinking_budget_tokens: Max tokens for internal reasoning (min 1024, recommended 16000+)
             max_tokens: Maximum tokens for response (must exceed thinking_budget_tokens)
-            max_history_messages: Maximum messages to keep in history (0 = unlimited)
+            summarization_threshold_tokens: Trigger summarization when prompt size exceeds this (0 = disabled)
             logger: Optional logger instance
         """
         self._memory = memory_manager
@@ -84,7 +84,9 @@ class UmaAgent:
         self._thinking_enabled = thinking_enabled
         self._thinking_budget_tokens = thinking_budget_tokens
         self._max_tokens = max_tokens
-        self._max_history_messages = max_history_messages
+        self._summarization_threshold_tokens = summarization_threshold_tokens
+        self._summarize_next_turn = False
+        self._last_input_tokens: Optional[int] = None
 
         # Initialize Anthropic API client
         self._init_api()
@@ -97,6 +99,10 @@ class UmaAgent:
         menus_screenshot: Optional[Path] = None,
     ) -> TurnResult:
         """Execute a single turn: get LLM decision and execute tools.
+
+        Context optimization: The current turn receives full vision data + screenshots,
+        but when stored in message history, only a compact summary is kept (~150 tokens
+        vs ~8,500). This prevents exponential token growth while preserving continuity.
 
         Args:
             turn_id: Unique turn identifier
@@ -112,6 +118,17 @@ class UmaAgent:
         """
         timestamp = datetime.now().isoformat()
         self._logger.info("Starting turn %s", turn_id)
+
+        # Check if we need to summarize before executing this turn
+        if self._summarization_threshold_tokens > 0 and self._summarize_next_turn:
+            last_tokens = self._last_input_tokens or 0
+            self._logger.warning(
+                "Last prompt used %d input tokens (max context %d); running summarization before next turn",
+                last_tokens,
+                self._max_context_tokens,
+            )
+            self._perform_summarization()
+            self._summarize_next_turn = False
 
         # Build context message (without turn history - that's in message_history now)
         user_message = self._format_context(turn_id, timestamp, vision_data)
@@ -154,11 +171,15 @@ class UmaAgent:
         except Exception as exc:
             raise AgentError(f"LLM request failed: {exc}") from exc
 
-        # Now store current user message in history WITHOUT images
-        message_content_for_history = [
-            block for block in message_content if block["type"] != "image"
-        ]
-        self._message_history.append({"role": "user", "content": message_content_for_history})
+        # Store compact turn summary in history (no images, no full vision JSON, no memory files)
+        # This dramatically reduces token accumulation in message history
+        compact_summary = self._format_compact_turn_context(turn_id, timestamp, vision_data)
+        self._logger.debug("Storing compact turn summary in history (~%d chars vs ~%d for full context)",
+                          len(compact_summary), len(user_message))
+        self._message_history.append({
+            "role": "user",
+            "content": [{"type": "text", "text": compact_summary}]
+        })
 
         # Extract reasoning and tool calls
         reasoning, thinking = self._extract_reasoning(response)
@@ -179,6 +200,10 @@ class UmaAgent:
 
             self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
                             turn_id, usage["input_tokens"], usage["output_tokens"])
+            self._last_input_tokens = usage["input_tokens"]
+            self._maybe_queue_summarization(usage["input_tokens"])
+        else:
+            self._last_input_tokens = None
 
         # Execute tools
         memory_actions, input_action, execution_results = self._execute_tools(tool_calls)
@@ -223,13 +248,6 @@ class UmaAgent:
         turn_summary = self._format_turn_summary(turn_id, reasoning, memory_actions, input_action)
         self._turn_summaries.append(turn_summary)
 
-        # Prune old messages if history exceeds limit
-        if self._max_history_messages > 0 and len(self._message_history) > self._max_history_messages:
-            excess = len(self._message_history) - self._max_history_messages
-            self._logger.info("Pruning %d old messages from history (keeping most recent %d)",
-                            excess, self._max_history_messages)
-            self._message_history = self._message_history[-self._max_history_messages:]
-
         return TurnResult(
             turn_id=turn_id,
             reasoning=reasoning,
@@ -252,9 +270,15 @@ class UmaAgent:
         # Turn metadata
         sections.append(f"# Turn {turn_id}\n\nTimestamp: {timestamp}\n")
 
-        # Vision data (JSON)
+        # Vision data (JSON) - strip internal fields (_bounds)
+        # These are only for the input handler, not the agent
+        clean_buttons = [
+            {k: v for k, v in btn.items() if not k.startswith("_")}
+            for btn in vision_data.buttons
+        ]
+
         vision_json = {
-            "buttons": vision_data.buttons,
+            "buttons": clean_buttons,
             "scrollbar": vision_data.scrollbar,
             "menu_state": vision_data.menu_state,
         }
@@ -436,6 +460,77 @@ class UmaAgent:
             self._logger.warning("Failed to extract tool calls: %s", exc)
             return []
 
+    def _format_compact_turn_context(
+        self,
+        turn_id: str,
+        timestamp: str,
+        vision_data: VisionData,
+    ) -> str:
+        """Format a compact turn summary for message history (not current turn).
+
+        This creates a minimal text representation that preserves context continuity
+        without the full vision JSON overhead. Used when storing turns in history.
+
+        Example output:
+            # Turn turn_000005
+            Timestamp: 2025-11-01T18:15:22.123456
+
+            Buttons: Archive, Profile, Titles, Friends, Options, Info button, Back button
+            Menu: tab=Menu, available=['Jukebox', 'Menu']
+            Scrollbar: none
+
+        Args:
+            turn_id: Turn identifier
+            timestamp: Turn timestamp
+            vision_data: Vision data for the turn
+
+        Returns:
+            Compact text summary (~150-200 tokens vs ~8,500 for full format)
+        """
+        lines = [f"# Turn {turn_id}", f"Timestamp: {timestamp}", ""]
+
+        # Button names only (no bounds, metadata, or full labels)
+        button_names = [btn["name"] for btn in vision_data.buttons]
+        if button_names:
+            # Format as comma-separated list, breaking into multiple lines if very long
+            buttons_text = ", ".join(button_names)
+            if len(buttons_text) > 200:
+                # Break into chunks for readability
+                chunks = []
+                current_chunk = []
+                current_length = 0
+                for name in button_names:
+                    if current_length + len(name) + 2 > 200 and current_chunk:
+                        chunks.append(", ".join(current_chunk))
+                        current_chunk = [name]
+                        current_length = len(name)
+                    else:
+                        current_chunk.append(name)
+                        current_length += len(name) + 2
+                if current_chunk:
+                    chunks.append(", ".join(current_chunk))
+                buttons_text = "\n  ".join(chunks)
+                lines.append(f"Buttons:\n  {buttons_text}")
+            else:
+                lines.append(f"Buttons: {buttons_text}")
+        else:
+            lines.append("Buttons: (none detected)")
+
+        # Menu state (minimal)
+        menu = vision_data.menu_state
+        if menu.get("tab") or menu.get("available"):
+            tab = menu.get("tab", "none")
+            available = menu.get("available", [])
+            lines.append(f"Menu: tab={tab}, available={available}")
+
+        # Scrollbar (yes/no only)
+        if vision_data.scrollbar and (vision_data.scrollbar.get("up") or vision_data.scrollbar.get("down")):
+            lines.append("Scrollbar: present")
+        else:
+            lines.append("Scrollbar: none")
+
+        return "\n".join(lines)
+
     def _format_turn_summary(
         self,
         turn_id: str,
@@ -443,7 +538,7 @@ class UmaAgent:
         memory_actions: List[Dict[str, Any]],
         input_action: Optional[Dict[str, Any]],
     ) -> str:
-        """Format a compact summary of a turn for history.
+        """Format a compact summary of a turn for logging.
 
         Args:
             turn_id: Turn identifier
@@ -477,6 +572,101 @@ class UmaAgent:
 
         lines.append("")
         return "\n".join(lines)
+
+    def _maybe_queue_summarization(self, input_tokens: int) -> None:
+        """Queue summarization for the next turn when prompt usage nears the limit.
+
+        Args:
+            input_tokens: Token count for the most recent prompt sent to the model
+        """
+        if self._summarization_threshold_tokens <= 0:
+            # Summarization disabled via config
+            return
+
+        ratio_threshold = int(self._max_context_tokens * 0.9)
+        trigger_tokens = min(self._summarization_threshold_tokens, ratio_threshold)
+        trigger_tokens = max(trigger_tokens, 1)
+
+        if input_tokens >= trigger_tokens:
+            self._summarize_next_turn = True
+            self._logger.warning(
+                "Input tokens %d exceeded summarization trigger %d (context max %d); "
+                "summarization queued for next turn",
+                input_tokens,
+                trigger_tokens,
+                self._max_context_tokens,
+            )
+        else:
+            self._summarize_next_turn = False
+
+    def _perform_summarization(self) -> None:
+        """Summarize the entire message history and replace it with a compact summary.
+
+        This is called when cumulative input tokens exceed the threshold to prevent
+        context overflow. The agent is asked to summarize all its experiences,
+        then the message history is replaced with a single synthetic message.
+        """
+        self._logger.info("Performing context summarization (current history: %d messages)",
+                          len(self._message_history))
+
+        if not self._message_history:
+            self._logger.warning("Message history is empty, skipping summarization")
+            return
+
+        try:
+            # Call the model with the existing history + summarization request
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=AGENT_SYSTEM_PROMPT,
+                messages=self._message_history + [
+                    {"role": "user", "content": [{"type": "text", "text": SUMMARIZATION_PROMPT}]}
+                ],
+            )
+
+            # Extract the summary text
+            summary_parts = []
+            for block in response.content:
+                if block.type == "text":
+                    summary_parts.append(block.text)
+
+            if not summary_parts:
+                self._logger.error("Summarization produced no text, keeping existing history")
+                return
+
+            summary = "\n".join(summary_parts)
+            self._logger.info("Generated summary (%d characters)", len(summary))
+
+            # Replace message history with synthetic summary message
+            old_message_count = len(self._message_history)
+            self._message_history = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""# Historical Context Summary
+
+The following is a summary of your experience playing Uma Musume so far.
+Your full message history has been condensed to save context.
+
+{summary}
+
+---
+
+New turns will continue below this summary."""
+                        }
+                    ]
+                }
+            ]
+
+            self._logger.info(
+                "Summarization complete: %d messages → 1 summary message",
+                old_message_count
+            )
+
+        except Exception as exc:
+            self._logger.error("Summarization failed: %s. Keeping existing history.", exc)
 
 
 __all__ = ["UmaAgent", "AgentError", "VisionData", "TurnResult"]

@@ -144,6 +144,10 @@ class GameLoopCoordinator:
         self._last_menu_tab: Optional[str] = None
         self._last_menu_buttons_raw: List[Dict[str, Any]] = []
 
+        # Cache for full vision objects (needed by input handler, not serialized in logs)
+        self._current_scrollbar_full: Optional[Any] = None  # ScrollbarInfo
+        self._current_menu_state_full: Optional[Any] = None  # MenuState
+
         # Ensure DPI awareness is set before any window operations
         set_dpi_aware()
 
@@ -169,7 +173,7 @@ class GameLoopCoordinator:
             thinking_enabled=agent_config.thinking_enabled,
             thinking_budget_tokens=agent_config.thinking_budget_tokens,
             max_tokens=agent_config.max_tokens,
-            max_history_messages=agent_config.max_history_messages,
+            summarization_threshold_tokens=agent_config.summarization_threshold_tokens,
             logger=self._logger,
         )
         self._input_handler = InputHandler(
@@ -310,13 +314,15 @@ class GameLoopCoordinator:
         Returns:
             VisionData for agent consumption
         """
+        # Clear cached full objects from previous turn
+        self._current_scrollbar_full = None
+        self._current_menu_state_full = None
+
         buttons = []
         scrollbar_info = None
         menu_state_dict: Dict[str, Any] = {
-            "is_usable": False,
-            "selected_tab": None,
-            "tabs": [],
-            "available_tabs": [],
+            "tab": None,
+            "available": [],
         }
 
         # Process menus region
@@ -325,19 +331,18 @@ class GameLoopCoordinator:
             and capture_result.menus_path.exists()
             and capture_result.menus_image is not None
         ):
-            # Menu state analysis
+            # Menu state analysis (compact format for agent)
             menu_state = self._vision.analyze_menu(
                 capture_result.menus_image,
                 tabs_image=capture_result.tabs_image,
             )
+            # Store full menu state for input handler (not in VisionData to keep it JSON-serializable)
+            self._current_menu_state_full = menu_state
+
+            # Compact format: just current tab and available tabs
             menu_state_dict = {
-                "is_usable": menu_state.is_usable,
-                "selected_tab": menu_state.selected_tab,
-                "tabs": [
-                    {"name": t.name, "is_selected": t.is_selected, "availability": t.availability.value}
-                    for t in menu_state.tabs
-                ],
-                "available_tabs": menu_state.available_tabs(),
+                "tab": menu_state.selected_tab,
+                "available": menu_state.available_tabs(),
             }
 
             # Button detection in menus
@@ -381,17 +386,26 @@ class GameLoopCoordinator:
                     )
                     # Apply region offset to convert to full client coordinates
                     bounds = (x + offset_x, y + offset_y, w, h)
-                    buttons.append({
+
+                    # Build compact button entry for agent (no bounds, no full_label)
+                    # Bounds are preserved in VisionOutput for input handler
+                    button_entry = {
                         "name": name,
-                        "full_label": btn_raw["label"],
-                        "bounds": bounds,
-                        "metadata": metadata,
                         "region": "menus",
-                    })
+                    }
+                    # Add metadata only if non-empty (compact string format)
+                    if metadata:
+                        meta_str = ", ".join(f"{k}={v}" for k, v in metadata.items())
+                        button_entry["meta"] = meta_str
+
+                    # Store bounds internally for input handler (will be added to VisionOutput)
+                    button_entry["_bounds"] = bounds  # Temporary, used by input handler setup
+                    buttons.append(button_entry)
             else:
-                # Menu not usable; clear cache
+                # Menu not usable; clear caches
                 self._last_menu_tab = None
                 self._last_menu_buttons_raw = []
+                self._current_menu_state_full = None
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():
@@ -416,23 +430,32 @@ class GameLoopCoordinator:
                 )
                 # Apply region offset to convert to full client coordinates
                 bounds = (x + offset_x, y + offset_y, w, h)
-                buttons.append({
-                    "name": name,
-                    "full_label": btn_raw["label"],
-                    "bounds": bounds,
-                    "metadata": metadata,
-                    "region": "primary",
-                })
 
-            # Scrollbar detection
+                # Build compact button entry for agent (no bounds, no full_label)
+                # Bounds are preserved in VisionOutput for input handler
+                button_entry = {
+                    "name": name,
+                    "region": "primary",
+                }
+                # Add metadata only if non-empty (compact string format)
+                if metadata:
+                    meta_str = ", ".join(f"{k}={v}" for k, v in metadata.items())
+                    button_entry["meta"] = meta_str
+
+                # Store bounds internally for input handler (will be added to VisionOutput)
+                button_entry["_bounds"] = bounds  # Temporary, used by input handler setup
+                buttons.append(button_entry)
+
+            # Scrollbar detection (compact format for agent)
             scrollbar = self._vision.detect_primary_scrollbar(capture_result.primary_image)
             if scrollbar:
+                # Store full scrollbar for input handler (not in VisionData to keep it JSON-serializable)
+                self._current_scrollbar_full = scrollbar
+
+                # Compact format: only up/down booleans (agent doesn't need bounds/ratios)
                 scrollbar_info = {
-                    "track_bounds": scrollbar.track_bounds,
-                    "thumb_bounds": scrollbar.thumb_bounds,
-                    "can_scroll_up": scrollbar.can_scroll_up,
-                    "can_scroll_down": scrollbar.can_scroll_down,
-                    "thumb_ratio": scrollbar.thumb_ratio,
+                    "up": scrollbar.can_scroll_up,
+                    "down": scrollbar.can_scroll_down,
                 }
 
         return VisionData(
@@ -457,30 +480,42 @@ class GameLoopCoordinator:
         action_name = action["name"]
         args = action.get("arguments", {})
 
-        # Build VisionOutput for input handler
+        # Build VisionOutput for input handler (extract bounds from _bounds field)
         button_infos = []
         for btn in vision_data.buttons:
             from lluma_os.input_handler import ButtonInfo
 
+            # Reconstruct full_label from name + metadata for input handler
+            full_label = btn["name"]
+            metadata_dict = {}
+            if "meta" in btn:
+                # Parse compact metadata string back to dict
+                for pair in btn["meta"].split(", "):
+                    if "=" in pair:
+                        k, v = pair.split("=", 1)
+                        metadata_dict[k] = v
+
             button_infos.append(
                 ButtonInfo(
                     name=btn["name"],
-                    full_label=btn["full_label"],
-                    bounds=tuple(btn["bounds"]),  # type: ignore
-                    metadata=btn["metadata"],
+                    full_label=full_label,
+                    bounds=tuple(btn["_bounds"]),  # type: ignore - Extract stored bounds
+                    metadata=metadata_dict,
                 )
             )
 
         scrollbar_for_handler = None
-        if vision_data.scrollbar:
+        if self._current_scrollbar_full is not None:
             from lluma_os.input_handler import ScrollbarInfo
 
+            # Use cached full scrollbar info
+            full_scrollbar = self._current_scrollbar_full
             scrollbar_for_handler = ScrollbarInfo(
-                track_bounds=tuple(vision_data.scrollbar["track_bounds"]),  # type: ignore
-                thumb_bounds=tuple(vision_data.scrollbar["thumb_bounds"]),  # type: ignore
-                can_scroll_up=vision_data.scrollbar["can_scroll_up"],
-                can_scroll_down=vision_data.scrollbar["can_scroll_down"],
-                thumb_ratio=vision_data.scrollbar["thumb_ratio"],
+                track_bounds=tuple(full_scrollbar.track_bounds),  # type: ignore
+                thumb_bounds=tuple(full_scrollbar.thumb_bounds),  # type: ignore
+                can_scroll_up=full_scrollbar.can_scroll_up,
+                can_scroll_down=full_scrollbar.can_scroll_down,
+                thumb_ratio=full_scrollbar.thumb_ratio,
             )
 
         # Primary center (use center of primary image)
