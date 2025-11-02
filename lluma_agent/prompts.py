@@ -123,3 +123,15 @@ Example response:
 
 Note: Do not include explanatory text in your response - use tool calls only. Your thinking process will be logged separately for debugging.
 """
+
+SUMMARIZATION_PROMPT = """You have been playing Uma Musume for a while, and your message history is getting long.
+
+Please provide a comprehensive summary of everything you've learned and accomplished so far. Include:
+
+1. **Game Progress**: What have you done? What screens/features have you explored?
+2. **UI Knowledge**: What UI patterns have you learned? What buttons appear where?
+3. **Current State**: Where are you now in the game? What were you working on?
+4. **Key Discoveries**: Any important observations about game mechanics or navigation?
+
+Be concise but thorough. This summary will replace your entire message history, so include everything important.
+Focus on factual observations and progress, not speculation."""

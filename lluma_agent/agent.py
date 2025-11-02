@@ -15,7 +15,7 @@ from anthropic import Anthropic
 from PIL import Image
 
 from .memory import MemoryManager, MemoryError
-from .prompts import AGENT_SYSTEM_PROMPT
+from .prompts import AGENT_SYSTEM_PROMPT, SUMMARIZATION_PROMPT
 from .tools import ALL_TOOLS, INPUT_TOOL_NAMES, MEMORY_TOOL_NAMES
 
 Logger = logging.Logger
@@ -59,8 +59,7 @@ class UmaAgent:
         thinking_enabled: bool = True,
         thinking_budget_tokens: int = 16000,
         max_tokens: int = 4096,
-        max_history_messages: int = 20,
-        summarization_threshold_tokens: int = 150000,
+        summarization_threshold_tokens: int = 64000,
         logger: Optional[Logger] = None,
     ) -> None:
         """Initialize the agent.
@@ -72,8 +71,7 @@ class UmaAgent:
             thinking_enabled: Whether to enable extended thinking
             thinking_budget_tokens: Max tokens for internal reasoning (min 1024, recommended 16000+)
             max_tokens: Maximum tokens for response (must exceed thinking_budget_tokens)
-            max_history_messages: Maximum messages to keep in history (0 = unlimited)
-            summarization_threshold_tokens: Trigger summarization when cumulative input exceeds this
+            summarization_threshold_tokens: Trigger summarization when prompt size exceeds this (0 = disabled)
             logger: Optional logger instance
         """
         self._memory = memory_manager
@@ -86,7 +84,6 @@ class UmaAgent:
         self._thinking_enabled = thinking_enabled
         self._thinking_budget_tokens = thinking_budget_tokens
         self._max_tokens = max_tokens
-        self._max_history_messages = max_history_messages
         self._summarization_threshold_tokens = summarization_threshold_tokens
 
         # Initialize Anthropic API client
@@ -243,13 +240,6 @@ class UmaAgent:
         # Create human-readable summary for logging
         turn_summary = self._format_turn_summary(turn_id, reasoning, memory_actions, input_action)
         self._turn_summaries.append(turn_summary)
-
-        # Prune old messages if history exceeds limit
-        if self._max_history_messages > 0 and len(self._message_history) > self._max_history_messages:
-            excess = len(self._message_history) - self._max_history_messages
-            self._logger.info("Pruning %d old messages from history (keeping most recent %d)",
-                            excess, self._max_history_messages)
-            self._message_history = self._message_history[-self._max_history_messages:]
 
         return TurnResult(
             turn_id=turn_id,
@@ -630,19 +620,6 @@ class UmaAgent:
             self._logger.warning("Message history is empty, skipping summarization")
             return
 
-        # Build summarization prompt
-        summarization_prompt = """You have been playing Uma Musume for a while, and your message history is getting long.
-
-Please provide a comprehensive summary of everything you've learned and accomplished so far. Include:
-
-1. **Game Progress**: What have you done? What screens/features have you explored?
-2. **UI Knowledge**: What UI patterns have you learned? What buttons appear where?
-3. **Current State**: Where are you now in the game? What were you working on?
-4. **Key Discoveries**: Any important observations about game mechanics or navigation?
-
-Be concise but thorough. This summary will replace your entire message history, so include everything important.
-Focus on factual observations and progress, not speculation."""
-
         try:
             # Call the model with the existing history + summarization request
             response = self._client.messages.create(
@@ -650,7 +627,7 @@ Focus on factual observations and progress, not speculation."""
                 max_tokens=self._max_tokens,
                 system=AGENT_SYSTEM_PROMPT,
                 messages=self._message_history + [
-                    {"role": "user", "content": [{"type": "text", "text": summarization_prompt}]}
+                    {"role": "user", "content": [{"type": "text", "text": SUMMARIZATION_PROMPT}]}
                 ],
             )
 

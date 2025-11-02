@@ -173,7 +173,6 @@ class GameLoopCoordinator:
             thinking_enabled=agent_config.thinking_enabled,
             thinking_budget_tokens=agent_config.thinking_budget_tokens,
             max_tokens=agent_config.max_tokens,
-            max_history_messages=agent_config.max_history_messages,
             summarization_threshold_tokens=agent_config.summarization_threshold_tokens,
             logger=self._logger,
         )
