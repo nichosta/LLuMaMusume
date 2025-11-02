@@ -216,23 +216,28 @@ Anthropic's prompt caching allows reuse of static or semi-static prompt prefixes
 
 ### Priority 4: Context Summarization (Low-Medium Impact, safety net)
 
-When approaching context limits (e.g., >180K tokens cumulative), trigger automatic summarization.
+When message history size approaches model limits, trigger automatic summarization.
 
-**Trigger:** Total input tokens exceeds `max_context_tokens` threshold (current: 32K, but this is currently only for memory; we need a separate message history limit)
+**Trigger:** Estimated message history size exceeds `summarization_threshold_tokens` (default: 64K tokens)
+- Size is estimated using a simple heuristic: character count ÷ 4
+- This measures actual prompt size, not cumulative tokens across all turns
 
 **Summarization strategy:**
-1. Agent receives a special `summarizeContext` tool call request
-2. Agent reviews full message history and produces:
-   - High-level summary of game progress and discoveries
-   - Current objectives and state
-   - Key UI patterns learned
-3. Replace all message history with a single summarized "system message"
-4. Keep memory files intact (they have their own 32K budget)
-5. Resume normal operation
+1. Before the next turn, check if message history size exceeds threshold
+2. If exceeded, send a special summarization prompt asking the agent to review its entire history
+3. Agent produces a comprehensive summary including:
+   - Game progress and screens explored
+   - UI knowledge and patterns learned
+   - Current state and objectives
+   - Key discoveries about game mechanics
+4. Replace entire message history with a single summary message
+5. Keep memory files intact (they have their own 32K budget)
+6. Resume normal operation with compact context
 
 **Implementation approach:**
-- Add token counting to `_message_history` (track cumulative input tokens)
-- When threshold exceeded, inject summarization request
+- Estimate message history size before each turn (character count ÷ 4)
+- When estimated size exceeds threshold, trigger summarization
+- Agent summarizes full history into compact text
 - Replace `_message_history` with synthetic summary message
 - Log summarization events for debugging
 

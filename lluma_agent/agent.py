@@ -60,6 +60,7 @@ class UmaAgent:
         thinking_budget_tokens: int = 16000,
         max_tokens: int = 4096,
         max_history_messages: int = 20,
+        summarization_threshold_tokens: int = 150000,
         logger: Optional[Logger] = None,
     ) -> None:
         """Initialize the agent.
@@ -72,6 +73,7 @@ class UmaAgent:
             thinking_budget_tokens: Max tokens for internal reasoning (min 1024, recommended 16000+)
             max_tokens: Maximum tokens for response (must exceed thinking_budget_tokens)
             max_history_messages: Maximum messages to keep in history (0 = unlimited)
+            summarization_threshold_tokens: Trigger summarization when cumulative input exceeds this
             logger: Optional logger instance
         """
         self._memory = memory_manager
@@ -85,6 +87,7 @@ class UmaAgent:
         self._thinking_budget_tokens = thinking_budget_tokens
         self._max_tokens = max_tokens
         self._max_history_messages = max_history_messages
+        self._summarization_threshold_tokens = summarization_threshold_tokens
 
         # Initialize Anthropic API client
         self._init_api()
@@ -116,6 +119,16 @@ class UmaAgent:
         """
         timestamp = datetime.now().isoformat()
         self._logger.info("Starting turn %s", turn_id)
+
+        # Check if we need to summarize before executing this turn
+        estimated_prompt_tokens = self._estimate_prompt_size()
+        if self._should_summarize(estimated_prompt_tokens):
+            self._logger.warning(
+                "Estimated prompt size (%d tokens) exceeded threshold (%d), triggering summarization",
+                estimated_prompt_tokens,
+                self._summarization_threshold_tokens
+            )
+            self._perform_summarization()
 
         # Build context message (without turn history - that's in message_history now)
         user_message = self._format_context(turn_id, timestamp, vision_data)
@@ -562,6 +575,128 @@ class UmaAgent:
 
         lines.append("")
         return "\n".join(lines)
+
+    def _estimate_prompt_size(self) -> int:
+        """Estimate the size of the current message history in tokens.
+
+        Uses a simple heuristic: count characters and divide by 4 (rough approximation).
+
+        Returns:
+            Estimated token count for the message history
+        """
+        if not self._message_history:
+            return 0
+
+        # Count total characters in message history
+        total_chars = 0
+        for message in self._message_history:
+            content = message.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and "text" in block:
+                        total_chars += len(block["text"])
+                    elif isinstance(block, dict) and "type" in block and block["type"] == "text":
+                        total_chars += len(block.get("text", ""))
+
+        # Rough approximation: 1 token ≈ 4 characters
+        estimated_tokens = total_chars // 4
+        return estimated_tokens
+
+    def _should_summarize(self, estimated_prompt_tokens: int) -> bool:
+        """Check if we should trigger summarization based on prompt size.
+
+        Args:
+            estimated_prompt_tokens: Estimated size of the current prompt in tokens
+
+        Returns:
+            True if estimated prompt size exceeds threshold
+        """
+        return (
+            self._summarization_threshold_tokens > 0
+            and estimated_prompt_tokens >= self._summarization_threshold_tokens
+        )
+
+    def _perform_summarization(self) -> None:
+        """Summarize the entire message history and replace it with a compact summary.
+
+        This is called when cumulative input tokens exceed the threshold to prevent
+        context overflow. The agent is asked to summarize all its experiences,
+        then the message history is replaced with a single synthetic message.
+        """
+        self._logger.info("Performing context summarization (current history: %d messages)",
+                          len(self._message_history))
+
+        if not self._message_history:
+            self._logger.warning("Message history is empty, skipping summarization")
+            return
+
+        # Build summarization prompt
+        summarization_prompt = """You have been playing Uma Musume for a while, and your message history is getting long.
+
+Please provide a comprehensive summary of everything you've learned and accomplished so far. Include:
+
+1. **Game Progress**: What have you done? What screens/features have you explored?
+2. **UI Knowledge**: What UI patterns have you learned? What buttons appear where?
+3. **Current State**: Where are you now in the game? What were you working on?
+4. **Key Discoveries**: Any important observations about game mechanics or navigation?
+
+Be concise but thorough. This summary will replace your entire message history, so include everything important.
+Focus on factual observations and progress, not speculation."""
+
+        try:
+            # Call the model with the existing history + summarization request
+            response = self._client.messages.create(
+                model=self._model,
+                max_tokens=self._max_tokens,
+                system=AGENT_SYSTEM_PROMPT,
+                messages=self._message_history + [
+                    {"role": "user", "content": [{"type": "text", "text": summarization_prompt}]}
+                ],
+            )
+
+            # Extract the summary text
+            summary_parts = []
+            for block in response.content:
+                if block.type == "text":
+                    summary_parts.append(block.text)
+
+            if not summary_parts:
+                self._logger.error("Summarization produced no text, keeping existing history")
+                return
+
+            summary = "\n".join(summary_parts)
+            self._logger.info("Generated summary (%d characters)", len(summary))
+
+            # Replace message history with synthetic summary message
+            old_message_count = len(self._message_history)
+            self._message_history = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"""# Historical Context Summary
+
+The following is a summary of your experience playing Uma Musume so far.
+Your full message history has been condensed to save context.
+
+{summary}
+
+---
+
+New turns will continue below this summary."""
+                        }
+                    ]
+                }
+            ]
+
+            self._logger.info(
+                "Summarization complete: %d messages → 1 summary message",
+                old_message_count
+            )
+
+        except Exception as exc:
+            self._logger.error("Summarization failed: %s. Keeping existing history.", exc)
 
 
 __all__ = ["UmaAgent", "AgentError", "VisionData", "TurnResult"]
