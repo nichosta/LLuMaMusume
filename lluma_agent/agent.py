@@ -260,11 +260,22 @@ class UmaAgent:
         # Turn metadata
         sections.append(f"# Turn {turn_id}\n\nTimestamp: {timestamp}\n")
 
-        # Vision data (JSON)
+        # Vision data (JSON) - strip internal fields (_bounds, _full)
+        # These are only for the input handler, not the agent
+        clean_buttons = [
+            {k: v for k, v in btn.items() if not k.startswith("_")}
+            for btn in vision_data.buttons
+        ]
+        clean_scrollbar = None
+        if vision_data.scrollbar:
+            clean_scrollbar = {k: v for k, v in vision_data.scrollbar.items() if not k.startswith("_")}
+
+        clean_menu_state = {k: v for k, v in vision_data.menu_state.items() if not k.startswith("_")}
+
         vision_json = {
-            "buttons": vision_data.buttons,
-            "scrollbar": vision_data.scrollbar,
-            "menu_state": vision_data.menu_state,
+            "buttons": clean_buttons,
+            "scrollbar": clean_scrollbar,
+            "menu_state": clean_menu_state,
         }
         sections.append("# Vision Data\n")
         sections.append("```json")
@@ -502,13 +513,13 @@ class UmaAgent:
 
         # Menu state (minimal)
         menu = vision_data.menu_state
-        if menu.get("selected_tab") or menu.get("available_tabs"):
-            tab = menu.get("selected_tab", "none")
-            available = menu.get("available_tabs", [])
+        if menu.get("tab") or menu.get("available"):
+            tab = menu.get("tab", "none")
+            available = menu.get("available", [])
             lines.append(f"Menu: tab={tab}, available={available}")
 
         # Scrollbar (yes/no only)
-        if vision_data.scrollbar:
+        if vision_data.scrollbar and (vision_data.scrollbar.get("up") or vision_data.scrollbar.get("down")):
             lines.append("Scrollbar: present")
         else:
             lines.append("Scrollbar: none")
