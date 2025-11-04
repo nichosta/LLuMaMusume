@@ -6,10 +6,10 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from lluma_os.capture import CaptureManager, CaptureError
 from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
@@ -25,10 +25,47 @@ from lluma_os.input_handler import (
 from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
 from lluma_vision.menu_analyzer import MenuAnalyzer
 
-from .agent import AgentError, UmaAgent, VisionData
+try:
+    from .agent import AgentError, UmaAgent, VisionData
+except ModuleNotFoundError:  # pragma: no cover - dependency may be absent in tests
+    if TYPE_CHECKING:
+        raise
+    AgentError = RuntimeError  # type: ignore
+    UmaAgent = None  # type: ignore
+    VisionData = Any  # type: ignore
+
+from .cinematics import (
+    CinematicDetectionResult,
+    CinematicDetector,
+    CinematicKind,
+    CinematicObservation,
+    PlaybackState,
+)
 from .memory import MemoryManager
 
 Logger = logging.Logger
+
+
+@dataclass
+class CinematicControlState:
+    """Tracks ongoing cinematic gating between turns."""
+
+    active: bool = False
+    kind: CinematicKind = CinematicKind.NONE
+    enter_turn: int = 0
+    low_motion_frames: int = 0
+    last_playback: PlaybackState = PlaybackState.UNKNOWN
+    last_diff: float = 0.0
+    last_primary_diff: float = 0.0
+
+    def reset(self) -> None:
+        self.active = False
+        self.kind = CinematicKind.NONE
+        self.enter_turn = 0
+        self.low_motion_frames = 0
+        self.last_playback = PlaybackState.UNKNOWN
+        self.last_diff = 0.0
+        self.last_primary_diff = 0.0
 
 
 def convert_vlm_box_to_pixels(vlm_box: list, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
@@ -166,6 +203,11 @@ class GameLoopCoordinator:
             max_tokens=agent_config.max_memory_tokens,
             logger=self._logger,
         )
+        if UmaAgent is None:
+            raise CoordinatorError(
+                "UmaAgent dependencies are unavailable; install anthropic to run the coordinator"
+            )
+
         self._agent = UmaAgent(
             self._memory,
             model=agent_config.model,
@@ -181,6 +223,10 @@ class GameLoopCoordinator:
             config=InputConfig(),
             logger=self._logger,
         )
+        self._cinematic_detector = CinematicDetector(capture_config)
+        self._cinematic_state = CinematicControlState()
+        self._cinematic_min_low_frames = 2
+        self._cinematic_max_hold_turns = 12
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -255,8 +301,31 @@ class GameLoopCoordinator:
                 "menu_state": vision_data.menu_state,
             }
 
+            menu_is_usable = None
+            if self._current_menu_state_full is not None:
+                menu_is_usable = bool(self._current_menu_state_full.is_usable)
+
+            detection = self._cinematic_detector.observe(
+                CinematicObservation(
+                    image=capture_result.raw_image,
+                    menu_is_usable=menu_is_usable,
+                    button_labels=[btn["name"] for btn in vision_data.buttons],
+                )
+            )
+            block_agent, cinematic_info = self._update_cinematic_state(detection)
+            turn_log["cinematic"] = cinematic_info
+
+            if block_agent:
+                self._logger.info(
+                    "Cinematic detected (%s, %s); deferring agent",
+                    detection.kind.value,
+                    detection.playback.value,
+                )
+                self._save_turn_log(turn_id, turn_log)
+                return
+
             # Check for no buttons (failsafe condition)
-            if not vision_data.buttons:
+            if detection.kind is CinematicKind.NONE and not vision_data.buttons:
                 self._logger.warning("No buttons detected; attempting failsafe advanceDialogue")
                 turn_log["failsafe"] = "no_buttons_detected"
                 self._execute_failsafe_action(capture_result)
@@ -463,6 +532,96 @@ class GameLoopCoordinator:
             scrollbar=scrollbar_info,
             menu_state=menu_state_dict,
         )
+
+    def _update_cinematic_state(
+        self,
+        detection: CinematicDetectionResult,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Update cinematic gating and decide whether to pause the agent."""
+
+        info: Dict[str, Any] = {
+            "kind": detection.kind.value,
+            "playback": detection.playback.value,
+            "diff_score": detection.diff_score,
+            "primary_diff_score": detection.primary_diff_score,
+            "skip_hint_primary": detection.skip_hint_primary,
+            "skip_hint_tabs": detection.skip_hint_tabs,
+            "pin_present": detection.pin_present,
+            "menu_unusable_streak": detection.menu_unusable_streak,
+        }
+
+        state = self._cinematic_state
+
+        if detection.kind is CinematicKind.NONE:
+            if state.active:
+                self._logger.debug("Cinematic resolved; returning control to agent")
+            state.reset()
+            info["hold_turns"] = 0
+            info["low_motion_frames"] = 0
+            info["released_via"] = "none"
+            info["blocked"] = False
+            return False, info
+
+        if not state.active or detection.kind is not state.kind:
+            state.active = True
+            state.kind = detection.kind
+            state.enter_turn = self._turn_counter
+            state.low_motion_frames = 0
+            self._logger.info(
+                "Entering %s cinematic (turn %s)",
+                detection.kind.value,
+                self._turn_counter,
+            )
+
+        state.last_playback = detection.playback
+        state.last_diff = detection.diff_score
+        state.last_primary_diff = detection.primary_diff_score
+
+        if detection.playback is PlaybackState.PAUSED:
+            state.low_motion_frames += 1
+        else:
+            state.low_motion_frames = 0
+
+        hold_turns = max(0, self._turn_counter - state.enter_turn)
+        info["hold_turns"] = hold_turns
+        info["low_motion_frames"] = state.low_motion_frames
+
+        release_due_to_low_motion = (
+            detection.playback is PlaybackState.PAUSED
+            and state.low_motion_frames >= self._cinematic_min_low_frames
+        )
+        release_due_to_pin = (
+            detection.kind is CinematicKind.FULLSCREEN and detection.pin_present
+        )
+        release_due_to_primary_clear = (
+            detection.kind is CinematicKind.PRIMARY and not detection.skip_hint_primary
+        )
+        release_due_to_timeout = hold_turns >= self._cinematic_max_hold_turns
+
+        release_reason: Optional[str] = None
+        if release_due_to_low_motion:
+            release_reason = "low_motion"
+        elif release_due_to_pin:
+            release_reason = "pin_returned"
+        elif release_due_to_primary_clear:
+            release_reason = "primary_skip_cleared"
+        elif release_due_to_timeout:
+            release_reason = "timeout"
+
+        if release_reason is not None:
+            info["released_via"] = release_reason
+            if release_due_to_timeout:
+                self._logger.warning(
+                    "Cinematic gating exceeded %s turns; releasing control",
+                    self._cinematic_max_hold_turns,
+                )
+            state.reset()
+            info["blocked"] = False
+            return False, info
+
+        info["released_via"] = None
+        info["blocked"] = True
+        return True, info
 
     def _execute_input_action(
         self, action: Dict[str, Any], vision_data: VisionData, capture_result: Any
