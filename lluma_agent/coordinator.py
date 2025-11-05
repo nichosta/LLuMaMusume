@@ -23,7 +23,7 @@ from lluma_os.input_handler import (
     parse_button_label,
 )
 from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
-from lluma_vision.menu_analyzer import MenuAnalyzer
+from lluma_vision.menu_analyzer import MenuAnalyzer, MenuState
 
 try:
     from .agent import AgentError, UmaAgent, VisionData
@@ -292,24 +292,16 @@ class GameLoopCoordinator:
                 "validation": asdict(capture_result.validation),
             }
 
-            # Step 2: Vision processing
-            self._logger.info("Processing vision data...")
-            vision_data = self._process_vision(capture_result)
-            turn_log["vision"] = {
-                "buttons": vision_data.buttons,
-                "scrollbar": vision_data.scrollbar,
-                "menu_state": vision_data.menu_state,
-            }
-
+            precomputed_menu_state = self._precompute_menu_state(capture_result)
             menu_is_usable = None
-            if self._current_menu_state_full is not None:
-                menu_is_usable = bool(self._current_menu_state_full.is_usable)
+            if precomputed_menu_state is not None:
+                menu_is_usable = bool(precomputed_menu_state.is_usable)
 
             detection = self._cinematic_detector.observe(
                 CinematicObservation(
                     image=capture_result.raw_image,
                     menu_is_usable=menu_is_usable,
-                    button_labels=[btn["name"] for btn in vision_data.buttons],
+                    button_labels=(),
                 )
             )
             block_agent, cinematic_info = self._update_cinematic_state(detection)
@@ -321,8 +313,31 @@ class GameLoopCoordinator:
                     detection.kind.value,
                     detection.playback.value,
                 )
+                if precomputed_menu_state is not None:
+                    turn_log["vision"] = {
+                        "buttons": [],
+                        "scrollbar": None,
+                        "menu_state": {
+                            "tab": precomputed_menu_state.selected_tab,
+                            "available": precomputed_menu_state.available_tabs(),
+                        },
+                    }
+                else:
+                    turn_log["vision"] = {"skipped": "cinematic"}
                 self._save_turn_log(turn_id, turn_log)
                 return
+
+            # Step 2: Vision processing (VLM expensive calls only when needed)
+            self._logger.info("Processing vision data...")
+            vision_data = self._process_vision(
+                capture_result,
+                menu_state=precomputed_menu_state,
+            )
+            turn_log["vision"] = {
+                "buttons": vision_data.buttons,
+                "scrollbar": vision_data.scrollbar,
+                "menu_state": vision_data.menu_state,
+            }
 
             # Check for no buttons (failsafe condition)
             if detection.kind is CinematicKind.NONE and not vision_data.buttons:
@@ -374,7 +389,21 @@ class GameLoopCoordinator:
             self._save_turn_log(turn_id, turn_log)
             self._logger.info("Completed %s", turn_id)
 
-    def _process_vision(self, capture_result: Any) -> VisionData:
+    def _precompute_menu_state(self, capture_result: Any) -> Optional[MenuState]:
+        """Run cheap menu analysis to inform cinematic detection."""
+
+        if (
+            capture_result.menus_path
+            and capture_result.menus_path.exists()
+            and capture_result.menus_image is not None
+        ):
+            return self._vision.analyze_menu(
+                capture_result.menus_image,
+                tabs_image=capture_result.tabs_image,
+            )
+        return None
+
+    def _process_vision(self, capture_result: Any, *, menu_state: Optional[MenuState] = None) -> VisionData:
         """Process vision data from capture results.
 
         Args:
@@ -395,45 +424,47 @@ class GameLoopCoordinator:
         }
 
         # Process menus region
+        menu_state_obj = menu_state
         if (
             capture_result.menus_path
             and capture_result.menus_path.exists()
             and capture_result.menus_image is not None
         ):
             # Menu state analysis (compact format for agent)
-            menu_state = self._vision.analyze_menu(
-                capture_result.menus_image,
-                tabs_image=capture_result.tabs_image,
-            )
+            if menu_state_obj is None:
+                menu_state_obj = self._vision.analyze_menu(
+                    capture_result.menus_image,
+                    tabs_image=capture_result.tabs_image,
+                )
             # Store full menu state for input handler (not in VisionData to keep it JSON-serializable)
-            self._current_menu_state_full = menu_state
+            self._current_menu_state_full = menu_state_obj
 
             # Compact format: just current tab and available tabs
             menu_state_dict = {
-                "tab": menu_state.selected_tab,
-                "available": menu_state.available_tabs(),
+                "tab": menu_state_obj.selected_tab,
+                "available": menu_state_obj.available_tabs(),
             }
 
             # Button detection in menus
-            if menu_state.is_usable:
+            if menu_state_obj.is_usable:
                 menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
 
                 # If VLM returned no buttons but tab hasn't changed, reuse previous results
                 if (
                     not menu_buttons_raw
-                    and menu_state.selected_tab is not None
-                    and menu_state.selected_tab == self._last_menu_tab
+                    and menu_state_obj.selected_tab is not None
+                    and menu_state_obj.selected_tab == self._last_menu_tab
                     and self._last_menu_buttons_raw
                 ):
                     self._logger.info(
                         "Menu VLM returned no buttons for tab '%s'; reusing %d buttons from previous turn",
-                        menu_state.selected_tab,
+                        menu_state_obj.selected_tab,
                         len(self._last_menu_buttons_raw),
                     )
                     menu_buttons_raw = self._last_menu_buttons_raw
 
                 # Update cache for next turn
-                self._last_menu_tab = menu_state.selected_tab
+                self._last_menu_tab = menu_state_obj.selected_tab
                 self._last_menu_buttons_raw = menu_buttons_raw
 
                 # Images are in physical pixels, convert to logical for coordinate system
@@ -475,6 +506,9 @@ class GameLoopCoordinator:
                 self._last_menu_tab = None
                 self._last_menu_buttons_raw = []
                 self._current_menu_state_full = None
+        else:
+            menu_state_obj = None
+            self._current_menu_state_full = None
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():

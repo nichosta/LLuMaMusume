@@ -132,6 +132,11 @@ def _clamp_bounds(bounds: tuple[int, int, int, int], width: int, height: int) ->
 class CinematicDetector:
     """Stateful helper that tracks whether we appear to be inside a cinematic."""
 
+    _PRIMARY_SKIP_X_START_RATIO = 0.85
+    _PRIMARY_SKIP_X_END_OFFSET_RATIO = 0.01
+    _PRIMARY_SKIP_Y_START_RATIO = 0.88
+    _PRIMARY_SKIP_Y_END_OFFSET_RATIO = 0.015
+
     def __init__(
         self,
         capture_config: CaptureConfig,
@@ -141,10 +146,17 @@ class CinematicDetector:
         playing_diff_threshold: float = 0.05,
         paused_diff_threshold: float = 0.005,
         tabs_skip_threshold: float = 0.08,
-        primary_skip_threshold: float = 0.22,
+        primary_skip_threshold: float = 0.18,
         pin_bright_threshold: float = 0.5,
         tabs_bright_threshold: float = 0.12,
-        primary_bright_threshold: float = 0.25,
+        primary_bright_threshold: float = 0.15,
+        tabs_bright_ratio_max: float = 0.7,
+        tabs_color_warmth_threshold: float = 0.05,
+        tabs_color_balance_max: float = 0.18,
+        primary_color_warmth_threshold: float = 0.08,
+        primary_color_balance_max: float = 0.22,
+        primary_bright_ratio_max: float = 1.0,
+        primary_bright_ratio_high_threshold: float = 0.4,
     ) -> None:
         """Initialise the detector.
 
@@ -174,6 +186,13 @@ class CinematicDetector:
         self._pin_bright_threshold = pin_bright_threshold
         self._tabs_bright_threshold = tabs_bright_threshold
         self._primary_bright_threshold = primary_bright_threshold
+        self._tabs_bright_ratio_max = tabs_bright_ratio_max
+        self._tabs_color_warmth_threshold = tabs_color_warmth_threshold
+        self._tabs_color_balance_max = tabs_color_balance_max
+        self._primary_color_warmth_threshold = primary_color_warmth_threshold
+        self._primary_color_balance_max = primary_color_balance_max
+        self._primary_bright_ratio_max = primary_bright_ratio_max
+        self._primary_bright_ratio_high_threshold = primary_bright_ratio_high_threshold
 
         self._prev_luma: Optional[np.ndarray] = None
         self._prev_primary_luma: Optional[np.ndarray] = None
@@ -214,31 +233,48 @@ class CinematicDetector:
             tabs_x1,
             height,
         )
-        primary_skip_bounds = (
-            primary_x0 + int(round(primary_px * 0.6)),
-            int(round(height * 0.6)),
-            primary_x1,
-            height,
-        )
-        tabs_crop = observation.image.crop(
-            _clamp_bounds(tabs_skip_bounds, width, height)
-        ).convert("L")
+        primary_skip_x0 = primary_x0 + int(round(primary_px * self._PRIMARY_SKIP_X_START_RATIO))
+        primary_skip_x1 = primary_x1 - int(round(primary_px * self._PRIMARY_SKIP_X_END_OFFSET_RATIO))
+        if primary_skip_x1 <= primary_skip_x0:
+            primary_skip_x1 = primary_x1
+        primary_skip_y0 = int(round(height * self._PRIMARY_SKIP_Y_START_RATIO))
+        primary_skip_y1 = height - int(round(height * self._PRIMARY_SKIP_Y_END_OFFSET_RATIO))
+        if primary_skip_y1 <= primary_skip_y0:
+            primary_skip_y1 = height
+        primary_skip_bounds = (primary_skip_x0, primary_skip_y0, primary_skip_x1, primary_skip_y1)
+        tabs_bounds = _clamp_bounds(tabs_skip_bounds, width, height)
+        tabs_crop = observation.image.crop(tabs_bounds).convert("L")
         tabs_arr = np.asarray(tabs_crop, dtype=np.float32) / 255.0
+        tabs_color_warmth = 0.0
+        tabs_color_range = 0.0
         if tabs_arr.size:
             tabs_mean = float(tabs_arr.mean())
             tabs_std = float(tabs_arr.std())
             tabs_bright_ratio = float((tabs_arr >= 0.75).mean())
+            tabs_rgb = observation.image.crop(tabs_bounds).convert("RGB")
+            rgb_arr = np.asarray(tabs_rgb, dtype=np.float32) / 255.0
+            if rgb_arr.size:
+                channel_means = rgb_arr.reshape(-1, rgb_arr.shape[-1]).mean(axis=0)
+                tabs_color_warmth = float(channel_means[0] - channel_means[2])
+                tabs_color_range = float(channel_means.max() - channel_means.min())
         else:
             tabs_mean = tabs_std = tabs_bright_ratio = 0.0
 
-        primary_crop = observation.image.crop(
-            _clamp_bounds(primary_skip_bounds, width, height)
-        ).convert("L")
+        primary_bounds = _clamp_bounds(primary_skip_bounds, width, height)
+        primary_crop = observation.image.crop(primary_bounds).convert("L")
         primary_arr = np.asarray(primary_crop, dtype=np.float32) / 255.0
+        primary_color_warmth = 0.0
+        primary_color_range = 0.0
         if primary_arr.size:
             primary_mean = float(primary_arr.mean())
             primary_std = float(primary_arr.std())
             primary_bright_ratio = float((primary_arr >= 0.75).mean())
+            primary_rgb = observation.image.crop(primary_bounds).convert("RGB")
+            rgb_arr = np.asarray(primary_rgb, dtype=np.float32) / 255.0
+            if rgb_arr.size:
+                channel_means = rgb_arr.reshape(-1, rgb_arr.shape[-1]).mean(axis=0)
+                primary_color_warmth = float(channel_means[0] - channel_means[2])
+                primary_color_range = float(channel_means.max() - channel_means.min())
             if self._prev_primary_luma is not None and self._prev_primary_luma.shape == primary_arr.shape:
                 primary_diff_score = float(np.mean(np.abs(primary_arr - self._prev_primary_luma)))
             else:
@@ -261,20 +297,49 @@ class CinematicDetector:
         labels_norm = _normalise_labels(observation.button_labels)
         skip_label_hint = any("skip" in label for label in labels_norm)
 
+        menu_hint = observation.menu_is_usable
+        tabs_color_check = (
+            tabs_color_warmth >= self._tabs_color_warmth_threshold
+            or tabs_color_range <= self._tabs_color_balance_max
+        )
         skip_hint_tabs = (
-            tabs_std >= self._tabs_skip_threshold and tabs_bright_ratio >= self._tabs_bright_threshold
+            tabs_std >= self._tabs_skip_threshold
+            and tabs_bright_ratio >= self._tabs_bright_threshold
+            and tabs_bright_ratio <= self._tabs_bright_ratio_max
+            and tabs_color_check
         )
+        primary_color_check = (
+            primary_color_warmth >= self._primary_color_warmth_threshold
+            or primary_color_range <= self._primary_color_balance_max
+        )
+        primary_variance_check = primary_std >= self._primary_skip_threshold
+        primary_brightness_check = primary_bright_ratio >= self._primary_bright_threshold
+        primary_extra_bright = primary_bright_ratio >= self._primary_bright_ratio_high_threshold
         skip_hint_primary = (
-            primary_std >= self._primary_skip_threshold
-            and primary_bright_ratio >= self._primary_bright_threshold
+            primary_brightness_check
+            and primary_color_check
+            and primary_bright_ratio <= self._primary_bright_ratio_max
+            and (primary_variance_check or primary_extra_bright)
         )
+        if skip_hint_primary:
+            if menu_hint is True and not skip_label_hint:
+                skip_hint_primary = False
 
         if skip_label_hint:
             if not skip_hint_tabs and not skip_hint_primary:
                 # Fall back to the most likely region if the heuristics are inconclusive.
                 skip_hint_primary = True
 
-        if skip_hint_primary:
+        if skip_hint_tabs and skip_hint_primary:
+            primary_strength = primary_bright_ratio + primary_std
+            tabs_strength = tabs_bright_ratio + tabs_std
+            if primary_strength >= tabs_strength:
+                kind = CinematicKind.PRIMARY
+            else:
+                kind = CinematicKind.FULLSCREEN
+        elif skip_hint_tabs:
+            kind = CinematicKind.FULLSCREEN
+        elif skip_hint_primary:
             kind = CinematicKind.PRIMARY
         elif (
             not pin_present

@@ -229,7 +229,7 @@ Memory file naming:
 ## Turns
 
 Turn structure and timing
-- Each turn performs: ensure window (reposition only on the first turn) → capture → vision processing → agent reasoning → execute at most one input → persist the turn log → sleep for `agent.turn_post_padding_s` seconds (default 5s).
+- Each turn performs: ensure window (reposition only on the first turn) → capture → lightweight menu analysis + cinematic detection (short-circuiting before any VLM calls) → vision processing for buttons/scrollbars (only when not gated) → agent reasoning → execute at most one input → persist the turn log → sleep for `agent.turn_post_padding_s` seconds (default 5s).
 - Turn latency: Highly variable by model/load; budget ~10–30s. Add a fixed 5s padding between turns to smooth variance.
 - Timeouts: The Anthropic API call uses the SDK's default timeout. Failures raise `AgentError` for the turn and no input is issued.
 - Vision prompts (menus + primary) run sequentially inside `MenuAnalyzer`; there is no parallelism at present.
@@ -308,8 +308,9 @@ The agent runs indefinitely until manual intervention (Ctrl-C in the terminal). 
 - Debug logging can be configured via verbosity levels (error, warn, info, debug, trace).
 - Captures are retained (last 200 turns by default) for post-mortem analysis.
 - For quick window experiments (e.g., reproducing DPI or cursor drift issues) use `python -m lluma_os.window_cli <command>`; it can `status`, `focus`, `place`, `move`, `resize`, or `set` the Uma Musume window using logical-pixel coordinates. The `place` command requires `window.placement` to be configured in `config.yaml`.
-- Cinematic heuristics live in `lluma_agent/cinematics.py`. The detector watches the frame-diff score alongside three quick visual checks: (1) whether the bright “pin” control in the top-left corner is still present, (2) how lively the bottom-right primary region is (persistent Skip chip), and (3) variance/brightness in the right-hand tabs strip when a fullscreen Skip overlay appears. The coordinator defers handing turns to the agent while these signals indicate active motion and only resumes after a couple of consecutive low-motion frames (or when the pin/skip overlays clear) so we never waste actions mid-cutscene.
+- Cinematic heuristics live in `lluma_agent/cinematics.py`. The detector watches the frame-diff score alongside three quick visual checks: (1) whether the bright “pin” control in the top-left corner is still present, (2) how lively and highlight-weighted the bottom-right primary region is (white or warm Skip chip detected via brightness/colour-balance heuristics), and (3) variance/brightness in the right-hand tabs strip when a fullscreen Skip overlay appears (with additional colour-balance guards so static UI highlights don’t trigger). The coordinator defers handing turns to the agent while these signals indicate active motion and only resumes after a couple of consecutive low-motion frames (or when the pin/skip overlays clear) so we never waste actions mid-cutscene.
 - A CLI harness validates those heuristics offline: `python -m lluma_agent.cinematic_detector_cli <captures_or_dirs> [--metadata hints.json] [--assume-menu-disabled] [--json]`. Feed it saved PNGs (e.g. the samples in `captures/`) to see the derived diff, pin detection, skip hints, and the `FULLSCREEN`/`PRIMARY` classifications without hitting the live client.
+- Any images that should stick around for regression tests must be copied into `tests/data/`; treat everything under `captures/` as temporary scratch captures.
 
 ## Error Recovery
 - **Window closure**: If the game window is closed, the program immediately stops.

@@ -107,11 +107,18 @@ def test_fullscreen_skip_overlay_flagged(capture_config):
     assert skip_frame.skip_hint_tabs is True
 
 
-def test_primary_cutscene_skip_chip_detection(capture_config):
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "primary_cutscene_skip.png",
+        "primary_cutscene_skip_white.png",
+    ],
+)
+def test_primary_cutscene_skip_chip_detection(capture_config, filename):
     detector = CinematicDetector(capture_config)
     result = detector.observe(
         CinematicObservation(
-            image=_load_rgb_image("primary_cutscene_skip.png"),
+            image=_load_rgb_image(filename),
             menu_is_usable=False,
         )
     )
