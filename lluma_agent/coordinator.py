@@ -176,6 +176,7 @@ class GameLoopCoordinator:
         self._capture_config = capture_config
         self._should_stop = False
         self._turn_counter = 0
+        self._interrupt_count = 0
 
         # Cache for menu button results (reuse if tab hasn't changed and VLM fails)
         self._last_menu_tab: Optional[str] = None
@@ -814,8 +815,14 @@ class GameLoopCoordinator:
             signum: Signal number
             frame: Current stack frame
         """
-        self._logger.info("Received signal %d, stopping after current turn", signum)
-        self._should_stop = True
+        self._interrupt_count += 1
+
+        if self._interrupt_count == 1:
+            self._logger.info("Received signal %d, stopping after current turn (press Ctrl+C again to force-stop)", signum)
+            self._should_stop = True
+        else:
+            self._logger.warning("Force-stop requested, terminating immediately")
+            sys.exit(130)  # Standard exit code for SIGINT
 
 
 __all__ = ["GameLoopCoordinator", "CoordinatorError"]

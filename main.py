@@ -71,7 +71,7 @@ def main() -> int:
         )
 
         logger.info("Starting game loop...")
-        logger.info("Press Ctrl+C to stop gracefully")
+        logger.info("Press Ctrl+C to stop gracefully (or twice to force-stop immediately)")
         logger.info("")
 
         coordinator.run(reposition=True)
