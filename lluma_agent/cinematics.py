@@ -157,6 +157,12 @@ class CinematicDetector:
         primary_color_balance_max: float = 0.22,
         primary_bright_ratio_max: float = 1.0,
         primary_bright_ratio_high_threshold: float = 0.4,
+        pin_std_threshold: float = 0.05,
+        pin_std_relaxed_threshold: float = 0.02,
+        pin_relaxed_mean_threshold: float = 0.8,
+        pin_relaxed_bright_ratio: float = 0.9,
+        primary_extra_bright_warmth_threshold: float = 0.12,
+        primary_extra_bright_color_min: float = 0.12,
     ) -> None:
         """Initialise the detector.
 
@@ -175,6 +181,19 @@ class CinematicDetector:
                 cinematic.
             primary_skip_threshold: Equivalent threshold for the primary-region
                 Skip chip (gacha/key cinematics).
+            pin_std_threshold: Minimum variance required to treat the pin
+                control as confidently visible.
+            pin_std_relaxed_threshold: Reduced variance floor that still counts
+                as present when the region remains bright (e.g. modals fade the
+                pin).
+            pin_relaxed_mean_threshold: Mean luma required for the relaxed pin
+                path.
+            pin_relaxed_bright_ratio: Bright-pixel ratio required for the
+                relaxed pin path.
+            primary_extra_bright_warmth_threshold: Minimum colour warmth required
+                for the extra-bright fallback path when variance is low.
+            primary_extra_bright_color_min: Minimum colour range required for
+                the extra-bright fallback path when variance is low.
         """
         self._capture_config = capture_config
         self._downscale_width = downscale_width
@@ -193,6 +212,12 @@ class CinematicDetector:
         self._primary_color_balance_max = primary_color_balance_max
         self._primary_bright_ratio_max = primary_bright_ratio_max
         self._primary_bright_ratio_high_threshold = primary_bright_ratio_high_threshold
+        self._pin_std_threshold = pin_std_threshold
+        self._pin_std_relaxed_threshold = pin_std_relaxed_threshold
+        self._pin_relaxed_mean_threshold = pin_relaxed_mean_threshold
+        self._pin_relaxed_bright_ratio = pin_relaxed_bright_ratio
+        self._primary_extra_bright_warmth_threshold = primary_extra_bright_warmth_threshold
+        self._primary_extra_bright_color_min = primary_extra_bright_color_min
 
         self._prev_luma: Optional[np.ndarray] = None
         self._prev_primary_luma: Optional[np.ndarray] = None
@@ -292,7 +317,17 @@ class CinematicDetector:
         pin_crop = observation.image.crop(pin_bounds).convert("L")
         pin_arr = np.asarray(pin_crop, dtype=np.float32) / 255.0
         pin_bright_ratio = float((pin_arr >= 0.8).mean()) if pin_arr.size else 0.0
-        pin_present = pin_bright_ratio >= self._pin_bright_threshold and pin_mean >= 0.6 and pin_std >= 0.05
+        pin_variance_ok = pin_std >= self._pin_std_threshold
+        pin_relaxed_ok = (
+            pin_std >= self._pin_std_relaxed_threshold
+            and pin_mean >= self._pin_relaxed_mean_threshold
+            and pin_bright_ratio >= self._pin_relaxed_bright_ratio
+        )
+        pin_present = (
+            pin_bright_ratio >= self._pin_bright_threshold
+            and pin_mean >= 0.6
+            and (pin_variance_ok or pin_relaxed_ok)
+        )
 
         labels_norm = _normalise_labels(observation.button_labels)
         skip_label_hint = any("skip" in label for label in labels_norm)
@@ -315,11 +350,21 @@ class CinematicDetector:
         primary_variance_check = primary_std >= self._primary_skip_threshold
         primary_brightness_check = primary_bright_ratio >= self._primary_bright_threshold
         primary_extra_bright = primary_bright_ratio >= self._primary_bright_ratio_high_threshold
+        primary_extra_bright_ok = (
+            primary_extra_bright
+            and primary_color_check
+            and (
+                primary_color_warmth >= self._primary_extra_bright_warmth_threshold
+                or primary_color_range >= self._primary_extra_bright_color_min
+            )
+        )
         skip_hint_primary = (
             primary_brightness_check
-            and primary_color_check
             and primary_bright_ratio <= self._primary_bright_ratio_max
-            and (primary_variance_check or primary_extra_bright)
+            and (
+                (primary_variance_check and primary_color_check)
+                or primary_extra_bright_ok
+            )
         )
         if skip_hint_primary:
             if menu_hint is True and not skip_label_hint:

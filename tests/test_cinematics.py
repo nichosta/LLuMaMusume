@@ -107,6 +107,20 @@ def test_fullscreen_skip_overlay_flagged(capture_config):
     assert skip_frame.skip_hint_tabs is True
 
 
+def test_dimmed_pin_prevents_false_fullscreen_detection(capture_config):
+    detector = CinematicDetector(capture_config)
+    frame = _load_rgb_image("fullscreen_pin_dimmed.png")
+    for _ in range(3):
+        result = detector.observe(
+            CinematicObservation(
+                image=frame,
+                menu_is_usable=False,
+            )
+        )
+        assert result.kind is CinematicKind.NONE
+        assert result.pin_present is True
+
+
 @pytest.mark.parametrize(
     "filename",
     [
@@ -125,3 +139,16 @@ def test_primary_cutscene_skip_chip_detection(capture_config, filename):
     assert result.kind is CinematicKind.PRIMARY
     assert result.skip_hint_primary is True
     assert result.playback in {PlaybackState.PAUSED, PlaybackState.PLAYING}
+
+
+def test_primary_modal_highlight_does_not_trigger_cutscene(capture_config):
+    detector = CinematicDetector(capture_config)
+    frame = _load_rgb_image("primary_story_modal_no_cinematic.png")
+    result = detector.observe(
+        CinematicObservation(
+            image=frame,
+            menu_is_usable=False,
+        )
+    )
+    assert result.kind is CinematicKind.NONE
+    assert result.skip_hint_primary is False

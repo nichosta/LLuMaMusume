@@ -136,6 +136,10 @@ class MenuVisionRegressionTest(unittest.TestCase):
             result = self.analyzer.detect_primary_scrollbar(image)
         self.assertIsNone(result)
 
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "storymenu_noscrollbar.png") as image:
+            story_none = self.analyzer.detect_primary_scrollbar(image)
+        self.assertIsNone(story_none)
+
         # Scrollbar near the bottom with travel remaining in both directions
         with Image.open(PRIMARY_SCROLLBAR_DIR / "missions_scrollbar_mid.png") as image:
             result = self.analyzer.detect_primary_scrollbar(image)
@@ -189,6 +193,17 @@ class MenuVisionRegressionTest(unittest.TestCase):
         self.assertLess(scroll.thumb_ratio, 0.2)
         self.assertFalse(scroll.can_scroll_up)
         self.assertTrue(scroll.can_scroll_down)
+
+        with Image.open(PRIMARY_SCROLLBAR_DIR / "storymenu_scrollbar.png") as image:
+            story_scroll = self.analyzer.detect_primary_scrollbar(image)
+
+        self.assertIsInstance(story_scroll, ScrollbarInfo)
+        assert story_scroll is not None
+        self.assertGreater(story_scroll.track_bounds[0], 740)
+        self.assertLess(story_scroll.track_bounds[0], 820)
+        self.assertGreater(story_scroll.thumb_bounds[3], 250)
+        self.assertTrue(story_scroll.can_scroll_up)
+        self.assertTrue(story_scroll.can_scroll_down)
 
 
 if __name__ == "__main__":  # pragma: no cover - allows direct invocation
