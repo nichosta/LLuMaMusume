@@ -18,6 +18,7 @@ Each turn sends the following to the Anthropic API:
 - Decision-making guidance
 
 **Caching potential:** HIGH (never changes)
+**Status:** Ready for caching implementation
 
 ### 2. Tool Definitions (Static, ~1,500 tokens)
 - 9 tool schemas in Anthropic format
@@ -25,34 +26,36 @@ Each turn sends the following to the Anthropic API:
 - Memory tools: `createMemoryFile`, `writeMemoryFile`, `deleteMemoryFile`
 
 **Caching potential:** HIGH (never changes)
+**Status:** Ready for caching implementation
 
-### 3. Message History (Variable, up to ~20 messages)
-- User messages: Turn context text only (images removed after current turn)
+### 3. Message History (Variable, ~1-5K tokens typical after optimizations)
+- User messages: Compact turn summaries for historical turns (~150-200 tokens each)
 - Assistant messages: Thinking blocks + text + tool_use blocks (preserved for continuity)
 - Tool result messages: Acknowledgment of tool execution
 
-**Current pruning:** Keep last 20 messages (`max_history_messages`)
-
+**Current optimization:** Historical turns use compact format (buttons names only, minimal menu/scrollbar state)
 **Caching potential:** MEDIUM (stable prefix can be cached, but tail changes every turn)
 
-### 4. Current Turn User Message (Variable, ~5K-10K tokens typical)
+### 4. Current Turn User Message (Variable, ~3K-6K tokens typical after optimizations)
 
 #### a. Turn Metadata (~50 tokens)
 - Turn ID (e.g., `turn_000123`)
 - Timestamp
 
-#### b. Vision Data JSON (~3K-6K tokens, **HIGH COST AREA**)
-**Buttons array** (biggest contributor):
-- Each button: ~150-200 tokens
-- Fields: `name`, `full_label`, `bounds`, `metadata`, `region`
-- Example: 21 buttons = ~3,500-4,000 tokens
+#### b. Vision Data JSON (~1K-3K tokens after optimization)
+**Buttons array** (optimized format):
+- Each button: ~65 tokens (down from ~180)
+- Fields: `name`, `meta` (optional compact string), `region`
+- Removed: `full_label`, `bounds`, verbose `metadata` dict
+- Example: 21 buttons = ~1,365 tokens (down from ~3,780)
 
-**Scrollbar** (when present): ~100 tokens
-- Fields: `track_bounds`, `thumb_bounds`, `can_scroll_up`, `can_scroll_down`, `thumb_ratio`
+**Scrollbar** (when present): ~30 tokens (down from ~100)
+- Compact format: `{"up": bool, "down": bool}`
+- Removed: `track_bounds`, `thumb_bounds`, `thumb_ratio`
 
-**Menu state**: ~300-500 tokens
-- Fields: `is_usable`, `selected_tab`, `tabs[]`, `available_tabs[]`
-- Tab entries: `name`, `is_selected`, `availability`
+**Menu state**: ~50 tokens (down from ~300)
+- Compact format: `{"tab": str, "available": [str]}`
+- Removed: `is_usable`, `tabs[]` array with full objects
 
 #### c. Screenshots (1.5K-3K tokens)
 - Primary region: ~1.5K tokens (always present)
@@ -63,13 +66,110 @@ Each turn sends the following to the Anthropic API:
 - Injected at end of context
 - Examples: `player.yaml`, `run.yaml`, `ui_knowledge.md`, `todo.md`
 
-**Caching potential:** MEDIUM (memory files change infrequently, could cache stable ones)
+**Caching potential:** MEDIUM-HIGH (memory files change infrequently, could cache stable ones)
+
+---
+
+## Implemented Optimizations (PR #12)
+
+### ✅ Phase 1: Historical Turn Trimming (Commit be95a8b)
+
+**Implementation:**
+- `_format_compact_turn_context()` method in agent.py (lines 463-532)
+- Stores only button names, minimal menu state, and scrollbar presence for historical turns
+- Full vision JSON and memory files are stripped (memory is re-injected every turn anyway)
+
+**Savings:**
+- Per historical turn: ~8,500 → ~150-200 tokens (**98% reduction**)
+- After 10 turns: ~85K → ~1.5K tokens in history
+- After 20 turns: ~170K → ~3K tokens saved
+
+**Example compact format:**
+```
+# Turn turn_000005
+Timestamp: 2025-11-01T18:15:22.123456
+
+Buttons: Archive, Profile, Titles, Friends, Options, Info button, Back button
+Menu: tab=Menu, available=['Jukebox', 'Menu']
+Scrollbar: none
+```
+
+### ✅ Phase 2: Current Turn Vision JSON Optimization (Commit eddae21)
+
+**Implementation:**
+- Coordinator emits compact button format for agent (coordinator.py, lines 490-503)
+- Maintains separate `VisionData` (for agent, compact) and `VisionOutput` (for input handler, full bounds)
+- Internal `_bounds` field stripped before sending to agent (agent.py, lines 274-278)
+- System prompt updated to document compact format (prompts.py)
+
+**Button format changes:**
+- Before: `{"name": "Archive", "full_label": "Archive | hint=NEW", "bounds": [...], "metadata": {"hint": "NEW"}, "region": "menus"}` (~180 tokens)
+- After: `{"name": "Archive", "meta": "hint=NEW", "region": "menus"}` (~65 tokens)
+- **Savings: ~65% per button**
+
+**Scrollbar format:**
+- Before: Full bounds, thumb_bounds, thumb_ratio, can_scroll_* (~100 tokens)
+- After: `{"up": true, "down": false}` (~30 tokens)
+
+**Menu state format:**
+- Before: Full tab objects with is_usable, selected_tab, tabs[] (~300 tokens)
+- After: `{"tab": "Menu", "available": ["Jukebox", "Menu"]}` (~50 tokens)
+
+**Total current-turn savings:** ~4,500 → ~1,600 tokens (**65% reduction**)
+
+### ✅ Phase 4: Context Summarization (Commit 0b7021c)
+
+**Implementation:**
+- `_maybe_queue_summarization()` checks if input tokens exceed threshold (agent.py, lines 576-600)
+- `_perform_summarization()` replaces entire history with single summary message (agent.py, lines 602-669)
+- Trigger: min(summarization_threshold_tokens, 90% of max_context_tokens)
+- Default threshold: 64,000 tokens (configurable via config.yaml)
+
+**How it works:**
+1. After each turn, check if last input token count exceeded trigger
+2. If yes, queue summarization for **next turn** (before executing it)
+3. Call model with existing history + summarization request
+4. Extract summary and replace `_message_history` with single synthetic message
+5. Resume normal operation with compact context
+
+**SUMMARIZATION_PROMPT:** Asks agent to summarize game progress, UI knowledge, current state, and key discoveries
+
+---
+
+## Remaining Work
+
+### 🚧 Phase 3: Prompt Caching (IN PROGRESS)
+
+**Goal:** Reduce token costs by 40-60% after warmup via Anthropic's prompt caching
+
+**Implementation plan:**
+
+1. **Static system context caching** (highest value)
+   - Add `cache_control: {type: "ephemeral"}` to system prompt
+   - Add cache breakpoint after tools in messages array
+   - **Savings:** ~3,800 tokens/turn after first turn (90% cheaper when cached)
+
+2. **Memory file caching** (when stable)
+   - Track which memory files have changed since last turn
+   - Add cache breakpoint after memory content when stable
+   - Invalidate when `writeMemoryFile` or `deleteMemoryFile` used
+   - **Savings:** 0-32K tokens/turn depending on memory size and stability
+
+3. **Message history prefix caching** (medium value)
+   - Cache stable older messages in history
+   - Keep recent 3-5 messages uncached (they change frequently)
+   - Refresh when history is pruned or summarized
+   - **Savings:** ~1K-3K tokens/turn typical
+
+**Expected total savings:** 40-60% of input tokens after warmup
+
+**Current status:** agent.py already captures cache stats (lines 196-199), ready for implementation
 
 ---
 
 ## Token Usage Measurements
 
-### Example Turn Analysis (turn_000006)
+### Before Optimizations (Early Testing)
 ```
 Input tokens:  24,479
 Output tokens:     595 (includes ~300 thinking tokens)
@@ -77,213 +177,34 @@ Output tokens:     595 (includes ~300 thinking tokens)
 Breakdown (estimated):
 - System prompt:        ~2,300
 - Tool definitions:     ~1,500
-- Message history:      ~8,000-10,000 (varies by turn)
+- Message history:      ~8,000-10,000 (10+ full historical turns)
 - Turn metadata:           ~50
-- Vision JSON:          ~4,500 (21 buttons + scrollbar + menu_state)
+- Vision JSON:          ~4,500 (21 buttons, full format)
 - Screenshots:          ~3,000 (2 images)
-- Memory files:         ~4,000-6,000 (varies)
+- Memory files:         ~4,000-6,000
 ```
 
-### Growth Patterns
-- **Images:** Fixed (1-2 per turn, older images not accumulated) → ~1.5K-3K/turn
-- **Thinking blocks:** ~300-500 tokens/turn (kept in message history until pruned)
-- **Button JSON:** Highly variable (10-30 buttons typical) → ~2K-6K/turn
-- **Memory files:** Slow growth (agent manages proactively) → target <32K cumulative
-
----
-
-## Optimization Targets
-
-### Priority 1: Button Metadata Format (High Impact)
-
-**Current format** (per button):
-```json
-{
-  "name": "Archive",
-  "full_label": "Archive | hint=NEW | section=Umamusume",
-  "bounds": [907, 418, 193, 49],
-  "metadata": {
-    "hint": "NEW",
-    "section": "Umamusume"
-  },
-  "region": "menus"
-}
+### After Optimizations (Current)
 ```
-**Token cost:** ~180 tokens/button
+Input tokens:  ~12,000-15,000 (40-50% reduction)
+Output tokens:     ~595
 
-**Redundancy identified:**
-1. `full_label` duplicates `name` + `metadata` (agent never uses full_label directly)
-2. `metadata` dict uses verbose JSON keys/braces even when empty or simple
-3. `region` is always short but adds overhead for every button
-
-**Optimization options:**
-
-**Option A (RECOMMENDED): Remove bounds + compact metadata**
-```json
-{
-  "name": "Archive",
-  "meta": "hint=NEW",
-  "region": "menus"
-}
-```
-**Rationale:**
-- **Bounds removed:** Agent has screenshot for spatial reasoning, bounds only used by input handler internally
-- **`full_label` removed:** Redundant with name + meta
-- **`metadata` → `meta`:** Compact string instead of dict (can omit if empty)
-
-**Savings:** ~60-65% per button (~180 → ~65 tokens)
-
-**Scrollbar trimmed:**
-```json
-{"up": true, "down": false}  // was: track_bounds, thumb_bounds, thumb_ratio, can_scroll_*
+Breakdown (estimated):
+- System prompt:        ~2,300
+- Tool definitions:     ~1,500
+- Message history:      ~1,500-3,000 (compact format)
+- Turn metadata:           ~50
+- Vision JSON:          ~1,600 (compact format)
+- Screenshots:          ~3,000
+- Memory files:         ~4,000-6,000
 ```
 
-**Menu state trimmed:**
-```json
-{"tab": "Menu", "available": ["Jukebox", "Menu"]}  // was: is_usable, selected_tab, tabs[], available_tabs[]
+### With Caching (Projected)
 ```
-
-**Total current-turn savings:** ~4,500 → ~1,600 tokens (**65% reduction**)
-
-### Priority 2: Historical Turn Trimming (HIGHEST Impact)
-
-**Current behavior:** Message history preserves full user messages (minus images):
-- Turn metadata (~50 tokens)
-- Full vision JSON (~4,500 tokens) ← **WASTEFUL**
-- Memory files (~4,000+ tokens) ← **WASTEFUL (memory is re-injected every turn anyway)**
-
-**Per historical turn:** ~8,500+ tokens
-**After 10 turns:** ~85,000 tokens of redundant data
-
-**New behavior:** Strip vision JSON and memory from historical user messages, replace with compact summary:
-
+Input tokens:  ~5,000-8,000 uncached + ~8,000-10,000 cached
+Effective cost: ~$0.005/turn (vs ~$0.010 optimized, ~$0.020 baseline)
+**70-75% cost reduction from baseline**
 ```
-Turn turn_000005 (2025-11-01T18:15:22)
-Buttons: Archive, Profile, Titles, Trophy Room, Friends, Options, Comics, Secrets, Info button, Back button, Story menu button, Home menu button, Race menu button, Scout menu button
-Menu: tab=Menu, available=[Jukebox, Menu]
-Scrollbar: none
-```
-
-**Per historical turn:** ~150-200 tokens (**98% reduction**)
-
-**Rationale:**
-1. **Button details:** Agent doesn't need bounds, metadata, or regions for past turns - just awareness of what was available
-2. **Memory files:** Already re-injected in current turn, no need to preserve in history
-3. **Vision JSON structure:** Not needed for continuity, agent just needs to know "what options were visible"
-4. **Action taken:** Preserved in assistant's tool_use block (already in history)
-
-**Implementation approach:**
-- After agent responds, before storing user message in `_message_history`:
-  - Extract button names only
-  - Extract menu tab + available tabs
-  - Extract scrollbar yes/no
-  - Format as compact text (not JSON)
-  - Replace the content
-
-**Combined savings (historical turns):**
-- Current: ~8,500 tokens/turn in history
-- Optimized: ~150 tokens/turn in history
-- **Net savings: ~8,350 tokens per historical turn**
-- **After 10 turns: ~83,500 tokens saved**
-
-### Priority 3: Prompt Caching (Medium-High Impact)
-
-Anthropic's prompt caching allows reuse of static or semi-static prompt prefixes across turns.
-
-**Cache breakpoints strategy:**
-
-1. **Static system context** (system prompt + tools) → Cache indefinitely
-   - System prompt (~2,300 tokens)
-   - Tool definitions (~1,500 tokens)
-   - **Savings:** ~3,800 tokens/turn after first turn
-
-2. **Memory files** (when stable) → Cache until modified
-   - Mark memory files with cache breakpoint after assistant response
-   - Refresh when `writeMemoryFile` or `deleteMemoryFile` used
-   - **Savings:** Variable (0-32K tokens/turn depending on memory size and stability)
-
-3. **Message history prefix** (older messages) → Cache stable prefix
-   - Mark a breakpoint after message N-5 (keep recent 5 messages uncached)
-   - Refresh when prefix changes
-   - **Savings:** Variable (~4K-8K tokens/turn typical)
-
-**Implementation requirements:**
-- Anthropic SDK `cache_control` parameter on message content blocks
-- Track cache invalidation (memory file writes, history pruning)
-- Monitor cache hit rates in usage stats
-
-**Expected total savings:** 40-60% of input tokens after warmup
-
-### Priority 4: Context Summarization (Low-Medium Impact, safety net)
-
-When message history size approaches model limits, trigger automatic summarization.
-
-**Trigger:** Estimated message history size exceeds `summarization_threshold_tokens` (default: 64K tokens)
-- Size is estimated using a simple heuristic: character count ÷ 4
-- This measures actual prompt size, not cumulative tokens across all turns
-
-**Summarization strategy:**
-1. Before the next turn, check if message history size exceeds threshold
-2. If exceeded, send a special summarization prompt asking the agent to review its entire history
-3. Agent produces a comprehensive summary including:
-   - Game progress and screens explored
-   - UI knowledge and patterns learned
-   - Current state and objectives
-   - Key discoveries about game mechanics
-4. Replace entire message history with a single summary message
-5. Keep memory files intact (they have their own 32K budget)
-6. Resume normal operation with compact context
-
-**Implementation approach:**
-- Estimate message history size before each turn (character count ÷ 4)
-- When estimated size exceeds threshold, trigger summarization
-- Agent summarizes full history into compact text
-- Replace `_message_history` with synthetic summary message
-- Log summarization events for debugging
-
-**Expected benefit:** Prevents context overflow, extends session longevity
-
----
-
-## Implementation Roadmap
-
-### Phase 1: Historical Turn Trimming (Highest Impact, Easy Win)
-- [ ] Add `_format_compact_turn_summary()` method to `UmaAgent`
-- [ ] Modify `execute_turn()` to store compact summary instead of full vision JSON
-- [ ] Keep full vision JSON only in current turn user message
-- [ ] Test that agent continuity is preserved
-- [ ] Measure token savings (expect ~8K/turn after first few turns)
-
-### Phase 2: Current Turn Vision JSON Optimization (High Impact, Medium Effort)
-- [ ] Update coordinator's `_process_vision()` to emit compact button format for agent
-  - Remove `bounds` from `VisionData` passed to agent (keep in `VisionOutput` for input handler)
-  - Remove `full_label`
-  - Change `metadata` → `meta` (compact string, omit if empty)
-  - Keep `region` (useful for agent to understand menus vs primary)
-- [ ] Update scrollbar format: `{"up": bool, "down": bool}`
-- [ ] Update menu format: `{"tab": str, "available": [str]}`
-- [ ] Update system prompt to document new format
-- [ ] Ensure input handler still receives full bounds via `VisionOutput` (separate data path)
-- [ ] Test button name matching still works
-- [ ] Measure token savings (expect ~3K/turn reduction)
-
-**Note:** The coordinator maintains two separate representations:
-- `VisionData` (for agent): Compact, no bounds
-- `VisionOutput` (for input handler): Full bounds included
-
-### Phase 3: Prompt Caching (Medium-High Impact, Medium Complexity)
-- [ ] Add cache breakpoints to system prompt + tools
-- [ ] Implement memory file cache invalidation logic
-- [ ] Add message history prefix caching (stable older messages)
-- [ ] Monitor cache hit rates in turn logs
-- [ ] Measure cost and latency improvements
-
-### Phase 4: Context Summarization (Safety Net)
-- [ ] Add cumulative token tracking to message history
-- [ ] Define summarization trigger threshold
-- [ ] Implement summarization prompt and flow
-- [ ] Test summarization quality
-- [ ] Deploy as safety net for long sessions
 
 ---
 
@@ -320,62 +241,71 @@ Track these in turn logs (`logs/<turn_id>.json`):
 - Output: $4.00 / 1M tokens
 - Cached input: $0.08 / 1M tokens (10x cheaper)
 
-**Per turn (example, no caching):**
+### Baseline (No Optimizations)
+**Per turn:**
 - 24,479 input tokens = $0.0196
 - 595 output tokens = $0.0024
 - **Total: ~$0.022/turn**
 
-### With Optimizations
+**At scale (100 turns):** ~$2.20
 
-**Phase 1: Historical turn trimming:**
-- Per historical turn: ~8,500 → ~150 tokens
-- After 10 turns: ~85K → ~1.5K tokens in history
-- **Savings at turn 10: ~$0.067** (cumulative from all trimmed turns)
-- **Savings at turn 20: ~$0.134** (grows linearly)
+### With Phase 1 + 2 Optimizations (Current)
+**Per turn after optimizations stabilize:**
+- ~13,000 input tokens = $0.0104
+- ~595 output tokens = $0.0024
+- **Total: ~$0.013/turn**
 
-**Phase 2: Current turn vision optimization:**
-- Vision JSON: ~4,500 → ~1,600 tokens/turn
-- **Savings: ~$0.0023/turn** (10% cost reduction per turn)
+**At scale (100 turns):** ~$1.30 (**41% savings**)
 
-**Phase 3: Prompt caching (assuming 60% cache hit after warmup):**
-- ~14,700 cached tokens, ~6,000 uncached (after vision optimization)
-- Input cost: (14,700 × $0.08 + 6,000 × $0.80) / 1M = $0.0060
-- **Savings: ~$0.0136/turn** (69% input cost reduction)
+### With Phase 3: Prompt Caching (Projected)
+**Assumptions:**
+- System prompt + tools: ~3,800 tokens (100% cache hit after turn 1)
+- Memory files: ~5,000 tokens (80% cache hit after stabilization)
+- Message history prefix: ~2,000 tokens (70% cache hit)
+- Current turn + recent history: ~5,000 tokens (0% cached)
 
-**Combined optimizations (at turn 20):**
-- Historical savings: ~$0.134 (cumulative)
-- Per-turn savings: ~$0.016/turn
-- **Cost per turn: ~$0.006** (73% reduction from baseline)
+**Token breakdown:**
+- Cached: ~9,000 tokens @ $0.08/1M = $0.00072
+- Uncached: ~5,000 tokens @ $0.80/1M = $0.00400
+- Output: ~595 tokens @ $4.00/1M = $0.00238
+- **Total: ~$0.007/turn**
 
-**At scale (100 turns):**
-- Current: ~$2.20
-- Optimized: ~$0.60
-- **Net savings: $1.60** (73% reduction)
+**At scale (100 turns):** ~$0.70 (**68% savings from baseline, 46% from current**)
 
-**At scale (1,000 turns):**
-- Current: ~$22.00
-- Optimized: ~$6.00
-- **Net savings: $16.00** (73% reduction + faster inference + lower rate limits)
+### With All Optimizations + Summarization
+**At 1,000 turns (with 2-3 summarization events):**
+- Baseline: ~$22.00
+- Optimized + cached: ~$7.00
+- **Net savings: $15.00 (68% reduction)**
+
+**Additional benefits:**
+- Faster inference (less tokens to process)
+- Lower rate limit pressure
+- Indefinite session length via summarization
 
 ---
 
 ## Future Considerations
 
-1. **Vision JSON compression:**
-   - Investigate JSON alternatives (msgpack, compressed strings)
-   - Trade-off: complexity vs. token savings
-
-2. **Selective memory injection:**
+1. **Selective memory injection:**
    - Only inject memory files relevant to current screen state
    - Requires context-aware memory file tagging
+   - Could reduce memory overhead by 50-70% on some turns
 
-3. **Message history pruning strategies:**
+2. **Message history pruning strategies:**
    - Prune less informative turns (e.g., simple dialogue advances)
    - Keep high-value turns (discoveries, decision points)
+   - Could reduce history size by additional 30-40%
+
+3. **Vision token optimization:**
+   - Screenshot compression or downsampling (trade-off: VLM accuracy)
+   - Skip menu screenshot when tab hasn't changed
+   - Potential 20-30% reduction in image tokens
 
 4. **VLM prompt optimization:**
    - Reduce button label verbosity at VLM output stage
-   - Requires VLM prompt updates in `lluma_vision/menu_analyzer.py`
+   - Requires updates in `lluma_vision/menu_analyzer.py`
+   - Could reduce VLM processing cost and initial button token count
 
 ---
 
@@ -386,3 +316,4 @@ Track these in turn logs (`logs/<turn_id>.json`):
 - System prompt: `lluma_agent/prompts.py`
 - Tool definitions: `lluma_agent/tools.py`
 - Anthropic Caching docs: https://docs.anthropic.com/en/docs/build-with-claude/prompt-caching
+- PR #12 (context management): Commits be95a8b, eddae21, 0b7021c
