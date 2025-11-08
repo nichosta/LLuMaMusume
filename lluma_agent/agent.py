@@ -224,11 +224,13 @@ class UmaAgent:
                 usage["cache_read_input_tokens"] = cache_read
 
             # Log with cache statistics
-            # Note: input_tokens includes both new tokens and cache creation tokens
-            # cache_read_input_tokens is separate and billed at a much lower rate
-            billable_input = usage["input_tokens"]
-            total_processed = billable_input + cache_read
-            uncached_new = billable_input - cache_creation  # New tokens (not written to cache)
+            # Per Anthropic docs: input_tokens, cache_creation_input_tokens, and cache_read_input_tokens
+            # are SEPARATE counts (not overlapping). Total = input + cache_creation + cache_read
+            # - input_tokens: Only tokens AFTER the last cache breakpoint (uncached new tokens)
+            # - cache_creation_input_tokens: Tokens written to cache
+            # - cache_read_input_tokens: Tokens read from cache (billed at lower rate)
+            uncached_new = usage["input_tokens"]  # Already represents uncached tokens
+            total_processed = uncached_new + cache_creation + cache_read
 
             if cache_read > 0 or cache_creation > 0:
                 cache_hit_rate = (cache_read / total_processed * 100) if total_processed > 0 else 0
