@@ -84,6 +84,17 @@ class CaptureConfig:
 
 
 @dataclass(slots=True)
+class VisionCacheConfig:
+    """Vision processing cache configuration for menu and primary regions."""
+
+    enabled: bool = True
+    hash_distance_threshold: int = 8  # Perceptual hash Hamming distance tolerance (bits)
+    max_age_turns: int = 10  # Maximum cache age in turns
+    menu_force_refresh_interval: int = 5  # Force refresh every N turns for menus
+    primary_force_refresh_interval: int = 3  # Force refresh every N turns for primary
+
+
+@dataclass(slots=True)
 class AgentConfig:
     """Agent and LLM configuration."""
 
@@ -99,6 +110,7 @@ class AgentConfig:
     thinking_budget_tokens: int = 12000
     max_tokens: int = 16000
     summarization_threshold_tokens: int = 64000  # Trigger summarization when message history size exceeds this (0 = disabled)
+    vision_cache: VisionCacheConfig = field(default_factory=VisionCacheConfig)
 
 
 def load_configs(path: Optional[Path] = None) -> Tuple[WindowConfig, CaptureConfig, AgentConfig]:
@@ -257,6 +269,20 @@ def _apply_agent_config(config: AgentConfig, data: Dict) -> None:
     if "summarization_threshold_tokens" in data:
         config.summarization_threshold_tokens = int(data["summarization_threshold_tokens"])
 
+    # Load vision cache config
+    vision_cache_data = data.get("vision_cache") or {}
+    if vision_cache_data:
+        if "enabled" in vision_cache_data:
+            config.vision_cache.enabled = bool(vision_cache_data["enabled"])
+        if "hash_distance_threshold" in vision_cache_data:
+            config.vision_cache.hash_distance_threshold = int(vision_cache_data["hash_distance_threshold"])
+        if "max_age_turns" in vision_cache_data:
+            config.vision_cache.max_age_turns = int(vision_cache_data["max_age_turns"])
+        if "menu_force_refresh_interval" in vision_cache_data:
+            config.vision_cache.menu_force_refresh_interval = int(vision_cache_data["menu_force_refresh_interval"])
+        if "primary_force_refresh_interval" in vision_cache_data:
+            config.vision_cache.primary_force_refresh_interval = int(vision_cache_data["primary_force_refresh_interval"])
+
 
 __all__ = [
     "WindowPlacement",
@@ -265,6 +291,7 @@ __all__ = [
     "CaptureValidationConfig",
     "RetentionConfig",
     "CaptureConfig",
+    "VisionCacheConfig",
     "AgentConfig",
     "load_configs",
 ]
