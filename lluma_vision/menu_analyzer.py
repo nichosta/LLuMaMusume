@@ -75,7 +75,8 @@ class MenuAnalyzer:
     SCROLLBAR_MIN_WIDTH = 8
     SCROLLBAR_MAX_WIDTH = 16
     SCROLLBAR_SEARCH_WIDTH = 200  # restrict detection to this many pixels from the right edge
-    SCROLLBAR_MIN_EDGE_STRENGTH = 5.0
+    SCROLLBAR_MIN_EDGE_STRENGTH = 18.0
+    SCROLLBAR_MAX_SCORE = 4.0
     SCROLLBAR_SMOOTH_KERNEL = 9
     SCROLLBAR_THUMB_DELTA = 28.0
     SCROLLBAR_MIN_THUMB_RATIO = 0.02
@@ -592,6 +593,9 @@ class MenuAnalyzer:
                 window = luma[:, left_edge:right_edge]
                 inside_std = float(np.std(window))
                 score = inside_std / (edge_strength + 1e-6)
+
+                if score > self.SCROLLBAR_MAX_SCORE:
+                    continue
 
                 if best_candidate is None or score < best_candidate[0]:
                     best_candidate = (score, left_edge, right_edge, edge_strength)

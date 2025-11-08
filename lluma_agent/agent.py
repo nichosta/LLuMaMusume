@@ -88,6 +88,9 @@ class UmaAgent:
         self._summarize_next_turn = False
         self._last_input_tokens: Optional[int] = None
 
+        # Track memory state for cache invalidation
+        self._memory_content_hash: Optional[str] = None
+
         # Initialize Anthropic API client
         self._init_api()
 
@@ -133,6 +136,11 @@ class UmaAgent:
         # Build context message (without turn history - that's in message_history now)
         user_message = self._format_context(turn_id, timestamp, vision_data)
 
+        # Check if memory has changed (for cache invalidation)
+        current_memory_hash = self._memory.get_content_hash()
+        memory_changed = (current_memory_hash != self._memory_content_hash)
+        self._memory_content_hash = current_memory_hash
+
         # Add screenshots (Anthropic format)
         message_content: List[Dict[str, Any]] = [
             {"type": "text", "text": user_message},
@@ -142,11 +150,24 @@ class UmaAgent:
         if menus_screenshot is not None and menus_screenshot.exists():
             message_content.append(self._encode_image(menus_screenshot))
 
-        # Build messages array for API call:
-        # - All historical messages (without images)
-        # - Current turn message (WITH images)
+        # Build messages array for API call with cache breakpoints:
+        # - Historical messages (cache stable prefix)
+        # - Current turn message (WITH images, uncached)
         # This prevents image token accumulation while keeping current turn visual
-        messages_for_api = self._message_history + [{"role": "user", "content": message_content}]
+        messages_for_api = self._build_messages_with_cache(
+            historical_messages=self._message_history,
+            current_content=message_content,
+            memory_changed=memory_changed,
+        )
+
+        # Build system prompt with cache control
+        system_blocks = [
+            {
+                "type": "text",
+                "text": AGENT_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"}
+            }
+        ]
 
         # Call LLM
         try:
@@ -158,12 +179,12 @@ class UmaAgent:
                     "budget_tokens": self._thinking_budget_tokens,
                 }
 
-            self._logger.info("Calling Anthropic model %s for turn %s (history: %d messages)",
-                            self._model, turn_id, len(messages_for_api))
+            self._logger.info("Calling Anthropic model %s for turn %s (history: %d messages, memory_changed: %s)",
+                            self._model, turn_id, len(messages_for_api), memory_changed)
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=AGENT_SYSTEM_PROMPT,
+                system=system_blocks,
                 messages=messages_for_api,
                 tools=ALL_TOOLS,
                 thinking=thinking_config,
@@ -193,13 +214,32 @@ class UmaAgent:
                 "output_tokens": response.usage.output_tokens,
             }
             # Cache stats are optional
+            cache_creation = 0
+            cache_read = 0
             if hasattr(response.usage, 'cache_creation_input_tokens'):
-                usage["cache_creation_input_tokens"] = response.usage.cache_creation_input_tokens
+                cache_creation = response.usage.cache_creation_input_tokens
+                usage["cache_creation_input_tokens"] = cache_creation
             if hasattr(response.usage, 'cache_read_input_tokens'):
-                usage["cache_read_input_tokens"] = response.usage.cache_read_input_tokens
+                cache_read = response.usage.cache_read_input_tokens
+                usage["cache_read_input_tokens"] = cache_read
 
-            self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
-                            turn_id, usage["input_tokens"], usage["output_tokens"])
+            # Log with cache statistics
+            # Note: input_tokens includes both new tokens and cache creation tokens
+            # cache_read_input_tokens is separate and billed at a much lower rate
+            billable_input = usage["input_tokens"]
+            total_processed = billable_input + cache_read
+            uncached_new = billable_input - cache_creation  # New tokens (not written to cache)
+
+            if cache_read > 0 or cache_creation > 0:
+                cache_hit_rate = (cache_read / total_processed * 100) if total_processed > 0 else 0
+                self._logger.info(
+                    "Turn %s usage - Processed: %d tokens (new: %d, cache_write: %d, cache_read: %d [%.1f%%]), Output: %d",
+                    turn_id, total_processed, uncached_new, cache_creation, cache_read, cache_hit_rate, usage["output_tokens"]
+                )
+            else:
+                self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
+                                turn_id, usage["input_tokens"], usage["output_tokens"])
+
             self._last_input_tokens = usage["input_tokens"]
             self._maybe_queue_summarization(usage["input_tokens"])
         else:
@@ -258,6 +298,73 @@ class UmaAgent:
             timestamp=timestamp,
             usage=usage,
         )
+
+    def _build_messages_with_cache(
+        self,
+        historical_messages: List[Dict[str, Any]],
+        current_content: List[Dict[str, Any]],
+        memory_changed: bool,
+    ) -> List[Dict[str, Any]]:
+        """Build messages array with cache control breakpoints.
+
+        Cache strategy:
+        1. System prompt: Always cached (set in system_blocks)
+        2. Message history prefix: Cache older messages (all but last 3)
+        3. Memory content: Cache when stable (tracked via hash)
+        4. Current turn: Never cached (changes every turn)
+
+        Args:
+            historical_messages: List of previous turn messages
+            current_content: Content for current turn message
+            memory_changed: Whether memory files changed since last turn
+
+        Returns:
+            Messages array with cache_control blocks inserted
+        """
+        messages = []
+
+        # Add historical messages with cache breakpoint after stable prefix
+        # Keep last 3 messages uncached (they're more likely to be referenced)
+        num_history = len(historical_messages)
+        cache_cutoff = max(0, num_history - 3)
+
+        for i, msg in enumerate(historical_messages):
+            # Copy message
+            msg_copy = msg.copy()
+
+            # Add cache control to last message in cacheable prefix
+            if i == cache_cutoff - 1 and cache_cutoff > 0:
+                # Add cache_control to the last content block of this message
+                content = msg_copy.get("content", [])
+                if isinstance(content, list) and len(content) > 0:
+                    # Make a deep copy of content array
+                    content_copy = []
+                    for j, block in enumerate(content):
+                        block_copy = block.copy() if isinstance(block, dict) else block
+                        # Add cache control to last block
+                        if j == len(content) - 1:
+                            block_copy["cache_control"] = {"type": "ephemeral"}
+                        content_copy.append(block_copy)
+                    msg_copy["content"] = content_copy
+
+            messages.append(msg_copy)
+
+        # Add current turn message with cache breakpoint on memory content (if stable)
+        # The memory content is in the first text block of current_content
+        current_msg_content = []
+        for i, block in enumerate(current_content):
+            block_copy = block.copy()
+
+            # Add cache control to the text block containing memory (first text block)
+            # BUT only if memory hasn't changed (otherwise cache is invalid)
+            if i == 0 and block.get("type") == "text" and not memory_changed:
+                block_copy["cache_control"] = {"type": "ephemeral"}
+
+            current_msg_content.append(block_copy)
+
+        messages.append({"role": "user", "content": current_msg_content})
+
+        return messages
 
     def _format_context(self, turn_id: str, timestamp: str, vision_data: VisionData) -> str:
         """Format the context message for the LLM.
@@ -614,11 +721,20 @@ class UmaAgent:
             return
 
         try:
+            # Build system prompt with cache control (summarization also benefits from caching)
+            system_blocks = [
+                {
+                    "type": "text",
+                    "text": AGENT_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ]
+
             # Call the model with the existing history + summarization request
             response = self._client.messages.create(
                 model=self._model,
                 max_tokens=self._max_tokens,
-                system=AGENT_SYSTEM_PROMPT,
+                system=system_blocks,
                 messages=self._message_history + [
                     {"role": "user", "content": [{"type": "text", "text": SUMMARIZATION_PROMPT}]}
                 ],

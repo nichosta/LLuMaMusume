@@ -1,6 +1,7 @@
 """Memory file management for agent scratchpad."""
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -151,6 +152,20 @@ class MemoryManager:
     def total_tokens(self) -> int:
         """Get current total token count across all files."""
         return self._total_tokens()
+
+    def get_content_hash(self) -> str:
+        """Get a hash of all memory file contents for cache invalidation.
+
+        Returns:
+            SHA256 hash of concatenated file contents (sorted by filename)
+        """
+        # Sort files by name for deterministic hashing
+        content_parts = []
+        for name in sorted(self._files.keys()):
+            content_parts.append(f"{name}:{self._files[name].content}")
+
+        combined = "\n".join(content_parts)
+        return hashlib.sha256(combined.encode("utf-8")).hexdigest()
 
     def _total_tokens(self) -> int:
         """Internal helper to compute total tokens."""

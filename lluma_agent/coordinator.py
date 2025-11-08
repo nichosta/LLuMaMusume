@@ -6,10 +6,10 @@ import logging
 import signal
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from lluma_os.capture import CaptureManager, CaptureError
 from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
@@ -23,12 +23,49 @@ from lluma_os.input_handler import (
     parse_button_label,
 )
 from lluma_os.window import UmaWindow, WindowNotFoundError, set_dpi_aware
-from lluma_vision.menu_analyzer import MenuAnalyzer
+from lluma_vision.menu_analyzer import MenuAnalyzer, MenuState
 
-from .agent import AgentError, UmaAgent, VisionData
+try:
+    from .agent import AgentError, UmaAgent, VisionData
+except ModuleNotFoundError:  # pragma: no cover - dependency may be absent in tests
+    if TYPE_CHECKING:
+        raise
+    AgentError = RuntimeError  # type: ignore
+    UmaAgent = None  # type: ignore
+    VisionData = Any  # type: ignore
+
+from .cinematics import (
+    CinematicDetectionResult,
+    CinematicDetector,
+    CinematicKind,
+    CinematicObservation,
+    PlaybackState,
+)
 from .memory import MemoryManager
 
 Logger = logging.Logger
+
+
+@dataclass
+class CinematicControlState:
+    """Tracks ongoing cinematic gating between turns."""
+
+    active: bool = False
+    kind: CinematicKind = CinematicKind.NONE
+    enter_turn: int = 0
+    low_motion_frames: int = 0
+    last_playback: PlaybackState = PlaybackState.UNKNOWN
+    last_diff: float = 0.0
+    last_primary_diff: float = 0.0
+
+    def reset(self) -> None:
+        self.active = False
+        self.kind = CinematicKind.NONE
+        self.enter_turn = 0
+        self.low_motion_frames = 0
+        self.last_playback = PlaybackState.UNKNOWN
+        self.last_diff = 0.0
+        self.last_primary_diff = 0.0
 
 
 def convert_vlm_box_to_pixels(vlm_box: list, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
@@ -139,6 +176,7 @@ class GameLoopCoordinator:
         self._capture_config = capture_config
         self._should_stop = False
         self._turn_counter = 0
+        self._interrupt_count = 0
 
         # Cache for menu button results (reuse if tab hasn't changed and VLM fails)
         self._last_menu_tab: Optional[str] = None
@@ -166,6 +204,11 @@ class GameLoopCoordinator:
             max_tokens=agent_config.max_memory_tokens,
             logger=self._logger,
         )
+        if UmaAgent is None:
+            raise CoordinatorError(
+                "UmaAgent dependencies are unavailable; install anthropic to run the coordinator"
+            )
+
         self._agent = UmaAgent(
             self._memory,
             model=agent_config.model,
@@ -181,6 +224,13 @@ class GameLoopCoordinator:
             config=InputConfig(),
             logger=self._logger,
         )
+        self._cinematic_detector = CinematicDetector(capture_config)
+        self._cinematic_state = CinematicControlState()
+        self._cinematic_min_low_frames = 2
+        self._cinematic_max_hold_turns = 12
+        # keep the agent paused for a short buffer after a cinematic clears
+        self._cinematic_release_buffer_turns = 2  # total blocked turns once release criteria are met
+        self._cinematic_release_cooldown = 0
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -246,9 +296,47 @@ class GameLoopCoordinator:
                 "validation": asdict(capture_result.validation),
             }
 
-            # Step 2: Vision processing
+            precomputed_menu_state = self._precompute_menu_state(capture_result)
+            menu_is_usable = None
+            if precomputed_menu_state is not None:
+                menu_is_usable = bool(precomputed_menu_state.is_usable)
+
+            detection = self._cinematic_detector.observe(
+                CinematicObservation(
+                    image=capture_result.raw_image,
+                    menu_is_usable=menu_is_usable,
+                    button_labels=(),
+                )
+            )
+            block_agent, cinematic_info = self._update_cinematic_state(detection)
+            turn_log["cinematic"] = cinematic_info
+
+            if block_agent:
+                self._logger.info(
+                    "Cinematic detected (%s, %s); deferring agent",
+                    detection.kind.value,
+                    detection.playback.value,
+                )
+                if precomputed_menu_state is not None:
+                    turn_log["vision"] = {
+                        "buttons": [],
+                        "scrollbar": None,
+                        "menu_state": {
+                            "tab": precomputed_menu_state.selected_tab,
+                            "available": precomputed_menu_state.available_tabs(),
+                        },
+                    }
+                else:
+                    turn_log["vision"] = {"skipped": "cinematic"}
+                self._save_turn_log(turn_id, turn_log)
+                return
+
+            # Step 2: Vision processing (VLM expensive calls only when needed)
             self._logger.info("Processing vision data...")
-            vision_data = self._process_vision(capture_result)
+            vision_data = self._process_vision(
+                capture_result,
+                menu_state=precomputed_menu_state,
+            )
             turn_log["vision"] = {
                 "buttons": vision_data.buttons,
                 "scrollbar": vision_data.scrollbar,
@@ -256,7 +344,7 @@ class GameLoopCoordinator:
             }
 
             # Check for no buttons (failsafe condition)
-            if not vision_data.buttons:
+            if detection.kind is CinematicKind.NONE and not vision_data.buttons:
                 self._logger.warning("No buttons detected; attempting failsafe advanceDialogue")
                 turn_log["failsafe"] = "no_buttons_detected"
                 self._execute_failsafe_action(capture_result)
@@ -305,7 +393,21 @@ class GameLoopCoordinator:
             self._save_turn_log(turn_id, turn_log)
             self._logger.info("Completed %s", turn_id)
 
-    def _process_vision(self, capture_result: Any) -> VisionData:
+    def _precompute_menu_state(self, capture_result: Any) -> Optional[MenuState]:
+        """Run cheap menu analysis to inform cinematic detection."""
+
+        if (
+            capture_result.menus_path
+            and capture_result.menus_path.exists()
+            and capture_result.menus_image is not None
+        ):
+            return self._vision.analyze_menu(
+                capture_result.menus_image,
+                tabs_image=capture_result.tabs_image,
+            )
+        return None
+
+    def _process_vision(self, capture_result: Any, *, menu_state: Optional[MenuState] = None) -> VisionData:
         """Process vision data from capture results.
 
         Args:
@@ -326,45 +428,47 @@ class GameLoopCoordinator:
         }
 
         # Process menus region
+        menu_state_obj = menu_state
         if (
             capture_result.menus_path
             and capture_result.menus_path.exists()
             and capture_result.menus_image is not None
         ):
             # Menu state analysis (compact format for agent)
-            menu_state = self._vision.analyze_menu(
-                capture_result.menus_image,
-                tabs_image=capture_result.tabs_image,
-            )
+            if menu_state_obj is None:
+                menu_state_obj = self._vision.analyze_menu(
+                    capture_result.menus_image,
+                    tabs_image=capture_result.tabs_image,
+                )
             # Store full menu state for input handler (not in VisionData to keep it JSON-serializable)
-            self._current_menu_state_full = menu_state
+            self._current_menu_state_full = menu_state_obj
 
             # Compact format: just current tab and available tabs
             menu_state_dict = {
-                "tab": menu_state.selected_tab,
-                "available": menu_state.available_tabs(),
+                "tab": menu_state_obj.selected_tab,
+                "available": menu_state_obj.available_tabs(),
             }
 
             # Button detection in menus
-            if menu_state.is_usable:
+            if menu_state_obj.is_usable:
                 menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
 
                 # If VLM returned no buttons but tab hasn't changed, reuse previous results
                 if (
                     not menu_buttons_raw
-                    and menu_state.selected_tab is not None
-                    and menu_state.selected_tab == self._last_menu_tab
+                    and menu_state_obj.selected_tab is not None
+                    and menu_state_obj.selected_tab == self._last_menu_tab
                     and self._last_menu_buttons_raw
                 ):
                     self._logger.info(
                         "Menu VLM returned no buttons for tab '%s'; reusing %d buttons from previous turn",
-                        menu_state.selected_tab,
+                        menu_state_obj.selected_tab,
                         len(self._last_menu_buttons_raw),
                     )
                     menu_buttons_raw = self._last_menu_buttons_raw
 
                 # Update cache for next turn
-                self._last_menu_tab = menu_state.selected_tab
+                self._last_menu_tab = menu_state_obj.selected_tab
                 self._last_menu_buttons_raw = menu_buttons_raw
 
                 # Images are in physical pixels, convert to logical for coordinate system
@@ -406,6 +510,9 @@ class GameLoopCoordinator:
                 self._last_menu_tab = None
                 self._last_menu_buttons_raw = []
                 self._current_menu_state_full = None
+        else:
+            menu_state_obj = None
+            self._current_menu_state_full = None
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():
@@ -463,6 +570,110 @@ class GameLoopCoordinator:
             scrollbar=scrollbar_info,
             menu_state=menu_state_dict,
         )
+
+    def _update_cinematic_state(
+        self,
+        detection: CinematicDetectionResult,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """Update cinematic gating and decide whether to pause the agent."""
+
+        info: Dict[str, Any] = {
+            "kind": detection.kind.value,
+            "playback": detection.playback.value,
+            "diff_score": detection.diff_score,
+            "primary_diff_score": detection.primary_diff_score,
+            "skip_hint_primary": detection.skip_hint_primary,
+            "skip_hint_tabs": detection.skip_hint_tabs,
+            "pin_present": detection.pin_present,
+            "menu_unusable_streak": detection.menu_unusable_streak,
+            "buffer_turns_remaining": max(self._cinematic_release_cooldown, 0),
+        }
+
+        state = self._cinematic_state
+
+        if detection.kind is CinematicKind.NONE:
+            if state.active:
+                self._logger.debug("Cinematic resolved; returning control to agent")
+            state.reset()
+            info["hold_turns"] = 0
+            info["low_motion_frames"] = 0
+            if self._cinematic_release_cooldown > 0:
+                self._cinematic_release_cooldown = max(0, self._cinematic_release_cooldown - 1)
+                info["buffer_turns_remaining"] = self._cinematic_release_cooldown
+                info["released_via"] = "post_release_buffer"
+                info["blocked"] = True
+                return True, info
+            info["released_via"] = "none"
+            info["buffer_turns_remaining"] = 0
+            info["blocked"] = False
+            return False, info
+
+        # Any new cinematic observation cancels pending release buffers.
+        self._cinematic_release_cooldown = 0
+        info["buffer_turns_remaining"] = 0
+        if not state.active or detection.kind is not state.kind:
+            state.active = True
+            state.kind = detection.kind
+            state.enter_turn = self._turn_counter
+            state.low_motion_frames = 0
+            self._logger.info(
+                "Entering %s cinematic (turn %s)",
+                detection.kind.value,
+                self._turn_counter,
+            )
+
+        state.last_playback = detection.playback
+        state.last_diff = detection.diff_score
+        state.last_primary_diff = detection.primary_diff_score
+
+        if detection.playback is PlaybackState.PAUSED:
+            state.low_motion_frames += 1
+        else:
+            state.low_motion_frames = 0
+
+        hold_turns = max(0, self._turn_counter - state.enter_turn)
+        info["hold_turns"] = hold_turns
+        info["low_motion_frames"] = state.low_motion_frames
+
+        release_due_to_low_motion = (
+            detection.playback is PlaybackState.PAUSED
+            and state.low_motion_frames >= self._cinematic_min_low_frames
+        )
+        release_due_to_pin = (
+            detection.kind is CinematicKind.FULLSCREEN and detection.pin_present
+        )
+        release_due_to_primary_clear = (
+            detection.kind is CinematicKind.PRIMARY and not detection.skip_hint_primary
+        )
+        release_due_to_timeout = hold_turns >= self._cinematic_max_hold_turns
+
+        release_reason: Optional[str] = None
+        if release_due_to_low_motion:
+            release_reason = "low_motion"
+        elif release_due_to_pin:
+            release_reason = "pin_returned"
+        elif release_due_to_primary_clear:
+            release_reason = "primary_skip_cleared"
+        elif release_due_to_timeout:
+            release_reason = "timeout"
+
+        if release_reason is not None:
+            info["released_via"] = release_reason
+            if release_due_to_timeout:
+                self._logger.warning(
+                    "Cinematic gating exceeded %s turns; releasing control",
+                    self._cinematic_max_hold_turns,
+                )
+            total_buffer = max(1, self._cinematic_release_buffer_turns)
+            self._cinematic_release_cooldown = max(0, total_buffer - 1)
+            info["buffer_turns_remaining"] = self._cinematic_release_cooldown
+            state.reset()
+            info["blocked"] = True
+            return True, info
+
+        info["released_via"] = None
+        info["blocked"] = True
+        return True, info
 
     def _execute_input_action(
         self, action: Dict[str, Any], vision_data: VisionData, capture_result: Any
@@ -621,8 +832,14 @@ class GameLoopCoordinator:
             signum: Signal number
             frame: Current stack frame
         """
-        self._logger.info("Received signal %d, stopping after current turn", signum)
-        self._should_stop = True
+        self._interrupt_count += 1
+
+        if self._interrupt_count == 1:
+            self._logger.info("Received signal %d, stopping after current turn (press Ctrl+C again to force-stop)", signum)
+            self._should_stop = True
+        else:
+            self._logger.warning("Force-stop requested, terminating immediately")
+            sys.exit(130)  # Standard exit code for SIGINT
 
 
 __all__ = ["GameLoopCoordinator", "CoordinatorError"]
