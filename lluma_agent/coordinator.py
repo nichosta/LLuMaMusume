@@ -228,6 +228,9 @@ class GameLoopCoordinator:
         self._cinematic_state = CinematicControlState()
         self._cinematic_min_low_frames = 2
         self._cinematic_max_hold_turns = 12
+        # keep the agent paused for a short buffer after a cinematic clears
+        self._cinematic_release_buffer_turns = 2  # total blocked turns once release criteria are met
+        self._cinematic_release_cooldown = 0
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -583,6 +586,7 @@ class GameLoopCoordinator:
             "skip_hint_tabs": detection.skip_hint_tabs,
             "pin_present": detection.pin_present,
             "menu_unusable_streak": detection.menu_unusable_streak,
+            "buffer_turns_remaining": max(self._cinematic_release_cooldown, 0),
         }
 
         state = self._cinematic_state
@@ -593,10 +597,20 @@ class GameLoopCoordinator:
             state.reset()
             info["hold_turns"] = 0
             info["low_motion_frames"] = 0
+            if self._cinematic_release_cooldown > 0:
+                self._cinematic_release_cooldown = max(0, self._cinematic_release_cooldown - 1)
+                info["buffer_turns_remaining"] = self._cinematic_release_cooldown
+                info["released_via"] = "post_release_buffer"
+                info["blocked"] = True
+                return True, info
             info["released_via"] = "none"
+            info["buffer_turns_remaining"] = 0
             info["blocked"] = False
             return False, info
 
+        # Any new cinematic observation cancels pending release buffers.
+        self._cinematic_release_cooldown = 0
+        info["buffer_turns_remaining"] = 0
         if not state.active or detection.kind is not state.kind:
             state.active = True
             state.kind = detection.kind
@@ -650,9 +664,12 @@ class GameLoopCoordinator:
                     "Cinematic gating exceeded %s turns; releasing control",
                     self._cinematic_max_hold_turns,
                 )
+            total_buffer = max(1, self._cinematic_release_buffer_turns)
+            self._cinematic_release_cooldown = max(0, total_buffer - 1)
+            info["buffer_turns_remaining"] = self._cinematic_release_cooldown
             state.reset()
-            info["blocked"] = False
-            return False, info
+            info["blocked"] = True
+            return True, info
 
         info["released_via"] = None
         info["blocked"] = True
