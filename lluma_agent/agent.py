@@ -224,13 +224,17 @@ class UmaAgent:
                 usage["cache_read_input_tokens"] = cache_read
 
             # Log with cache statistics
-            total_input = usage["input_tokens"]
-            uncached_input = total_input - cache_read
+            # Note: input_tokens includes both new tokens and cache creation tokens
+            # cache_read_input_tokens is separate and billed at a much lower rate
+            billable_input = usage["input_tokens"]
+            total_processed = billable_input + cache_read
+            uncached_new = billable_input - cache_creation  # New tokens (not written to cache)
+
             if cache_read > 0 or cache_creation > 0:
-                cache_hit_rate = (cache_read / total_input * 100) if total_input > 0 else 0
+                cache_hit_rate = (cache_read / total_processed * 100) if total_processed > 0 else 0
                 self._logger.info(
-                    "Turn %s usage - Input: %d (uncached: %d, cached: %d [%.1f%%], created: %d), Output: %d",
-                    turn_id, total_input, uncached_input, cache_read, cache_hit_rate, cache_creation, usage["output_tokens"]
+                    "Turn %s usage - Processed: %d tokens (new: %d, cache_write: %d, cache_read: %d [%.1f%%]), Output: %d",
+                    turn_id, total_processed, uncached_new, cache_creation, cache_read, cache_hit_rate, usage["output_tokens"]
                 )
             else:
                 self._logger.info("Turn %s usage - Input: %d, Output: %d tokens",
