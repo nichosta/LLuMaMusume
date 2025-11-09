@@ -7,6 +7,9 @@ requests
 pyyaml
 pytest
 anthropic
+Flask
+Flask-SocketIO
+watchdog
 
 # Optional (uncomment as needed)
 # keyboard

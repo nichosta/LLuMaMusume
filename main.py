@@ -4,8 +4,10 @@ import logging
 import sys
 from pathlib import Path
 
+import threading
 from lluma_agent import GameLoopCoordinator
 from lluma_os.config import load_configs
+from lluma_web.backend.server import run_app
 
 
 def setup_logging(level: int = logging.INFO) -> logging.Logger:
@@ -60,6 +62,11 @@ def main() -> int:
         logger.error("OPENROUTER_API_KEY environment variable not set")
         logger.error("Please set it before running: export OPENROUTER_API_KEY='your-key-here'")
         return 1
+
+    # Start the web server in a background thread
+    web_thread = threading.Thread(target=lambda: run_app(debug=False), daemon=True)
+    web_thread.start()
+    logger.info("Web UI server started at http://localhost:5000")
 
     # Initialize and run coordinator
     try:
