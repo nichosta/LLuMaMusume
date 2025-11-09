@@ -104,15 +104,13 @@ def _collect_files(inputs: Iterable[str]) -> list[Path]:
 def _format_result(path: Path, result) -> str:
     return (
         f"{path.name:45s}"
-        f" kind={result.kind.value:11s}"
+        f" kind={result.kind.value:9s}"
         f" playback={result.playback.value:7s}"
         f" diff={result.diff_score:0.4f}"
         f" primary_diff={result.primary_diff_score:0.4f}"
-        f" skip_primary={int(result.skip_hint_primary)}"
-        f" skip_tabs={int(result.skip_hint_tabs)}"
-        f" skip_label={int(result.skip_label_hint)}"
-        f" pin_present={int(result.pin_present)}"
-        f" menu_streak={result.menu_unusable_streak}"
+        f" changed={result.changed_ratio:0.4f}"
+        f" loading={int(result.is_loading_screen)}"
+        f" aggressive_static={int(result.aggressive_static)}"
     )
 
 
@@ -155,12 +153,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 "playback": result.playback.value,
                 "diff_score": result.diff_score,
                 "primary_diff_score": result.primary_diff_score,
-                "skip_hint_primary": result.skip_hint_primary,
-                "skip_hint_tabs": result.skip_hint_tabs,
-                "skip_label_hint": result.skip_label_hint,
-                "pin_present": result.pin_present,
-                "pin_bright_ratio": result.pin_bright_ratio,
-                "menu_unusable_streak": result.menu_unusable_streak,
+                "changed_ratio": result.changed_ratio,
+                "is_loading_screen": result.is_loading_screen,
+                "aggressive_static": result.aggressive_static,
             }
             print(json.dumps(payload))
         else:

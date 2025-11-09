@@ -231,6 +231,8 @@ class GameLoopCoordinator:
         # keep the agent paused for a short buffer after a cinematic clears
         self._cinematic_release_buffer_turns = 2  # total blocked turns once release criteria are met
         self._cinematic_release_cooldown = 0
+        self._default_turn_delay = agent_config.turn_post_padding_s
+        self._next_turn_delay = self._default_turn_delay
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGINT, self._handle_signal)
@@ -254,7 +256,7 @@ class GameLoopCoordinator:
 
                 # Post-turn padding
                 if not self._should_stop:
-                    time.sleep(self._agent_config.turn_post_padding_s)
+                    time.sleep(max(self._next_turn_delay, 0.0))
 
         except KeyboardInterrupt:
             self._logger.info("Received keyboard interrupt, stopping gracefully")
@@ -283,6 +285,7 @@ class GameLoopCoordinator:
             "timestamp": datetime.now().isoformat(),
             "reposition": reposition,
         }
+        self._next_turn_delay = self._default_turn_delay
 
         try:
             # Step 1: Capture
@@ -312,6 +315,7 @@ class GameLoopCoordinator:
             turn_log["cinematic"] = cinematic_info
 
             if block_agent:
+                self._next_turn_delay = self._cinematic_detector.poll_interval_s
                 self._logger.info(
                     "Cinematic detected (%s, %s); deferring agent",
                     detection.kind.value,
@@ -582,94 +586,80 @@ class GameLoopCoordinator:
             "playback": detection.playback.value,
             "diff_score": detection.diff_score,
             "primary_diff_score": detection.primary_diff_score,
-            "skip_hint_primary": detection.skip_hint_primary,
-            "skip_hint_tabs": detection.skip_hint_tabs,
-            "pin_present": detection.pin_present,
-            "menu_unusable_streak": detection.menu_unusable_streak,
+            "changed_ratio": detection.changed_ratio,
+            "is_loading_screen": detection.is_loading_screen,
+            "aggressive_static": detection.aggressive_static,
             "buffer_turns_remaining": max(self._cinematic_release_cooldown, 0),
         }
 
         state = self._cinematic_state
-
-        if detection.kind is CinematicKind.NONE:
-            if state.active:
-                self._logger.debug("Cinematic resolved; returning control to agent")
-            state.reset()
-            info["hold_turns"] = 0
-            info["low_motion_frames"] = 0
-            if self._cinematic_release_cooldown > 0:
+        if not state.active:
+            if detection.kind is CinematicKind.NONE and self._cinematic_release_cooldown <= 0:
+                info["released_via"] = "none"
+                info["hold_turns"] = 0
+                info["low_motion_frames"] = 0
+                info["blocked"] = False
+                return False, info
+            if detection.kind is CinematicKind.NONE and self._cinematic_release_cooldown > 0:
                 self._cinematic_release_cooldown = max(0, self._cinematic_release_cooldown - 1)
                 info["buffer_turns_remaining"] = self._cinematic_release_cooldown
                 info["released_via"] = "post_release_buffer"
+                info["hold_turns"] = 0
+                info["low_motion_frames"] = 0
                 info["blocked"] = True
                 return True, info
-            info["released_via"] = "none"
-            info["buffer_turns_remaining"] = 0
-            info["blocked"] = False
-            return False, info
 
-        # Any new cinematic observation cancels pending release buffers.
-        self._cinematic_release_cooldown = 0
-        info["buffer_turns_remaining"] = 0
-        if not state.active or detection.kind is not state.kind:
             state.active = True
-            state.kind = detection.kind
+            state.kind = detection.kind if detection.kind is not CinematicKind.NONE else CinematicKind.CUTSCENE
             state.enter_turn = self._turn_counter
             state.low_motion_frames = 0
             self._logger.info(
                 "Entering %s cinematic (turn %s)",
-                detection.kind.value,
+                state.kind.value,
                 self._turn_counter,
             )
+
+        if detection.kind is not CinematicKind.NONE:
+            state.kind = detection.kind
 
         state.last_playback = detection.playback
         state.last_diff = detection.diff_score
         state.last_primary_diff = detection.primary_diff_score
 
-        if detection.playback is PlaybackState.PAUSED:
+        if detection.playback is PlaybackState.PAUSED and not detection.is_loading_screen:
             state.low_motion_frames += 1
         else:
             state.low_motion_frames = 0
 
         hold_turns = max(0, self._turn_counter - state.enter_turn)
+        info["kind"] = state.kind.value
         info["hold_turns"] = hold_turns
         info["low_motion_frames"] = state.low_motion_frames
 
-        release_due_to_low_motion = (
-            detection.playback is PlaybackState.PAUSED
+        release_due_to_stability = (
+            not detection.is_loading_screen
+            and detection.playback is PlaybackState.PAUSED
             and state.low_motion_frames >= self._cinematic_min_low_frames
-        )
-        release_due_to_pin = (
-            detection.kind is CinematicKind.FULLSCREEN and detection.pin_present
-        )
-        release_due_to_primary_clear = (
-            detection.kind is CinematicKind.PRIMARY and not detection.skip_hint_primary
         )
         release_due_to_timeout = hold_turns >= self._cinematic_max_hold_turns
 
-        release_reason: Optional[str] = None
-        if release_due_to_low_motion:
-            release_reason = "low_motion"
-        elif release_due_to_pin:
-            release_reason = "pin_returned"
-        elif release_due_to_primary_clear:
-            release_reason = "primary_skip_cleared"
-        elif release_due_to_timeout:
-            release_reason = "timeout"
-
-        if release_reason is not None:
+        if release_due_to_stability or release_due_to_timeout:
+            release_reason = "low_motion" if release_due_to_stability else "timeout"
             info["released_via"] = release_reason
             if release_due_to_timeout:
                 self._logger.warning(
                     "Cinematic gating exceeded %s turns; releasing control",
                     self._cinematic_max_hold_turns,
                 )
-            total_buffer = max(1, self._cinematic_release_buffer_turns)
+            total_buffer = max(0, self._cinematic_release_buffer_turns)
             self._cinematic_release_cooldown = max(0, total_buffer - 1)
             info["buffer_turns_remaining"] = self._cinematic_release_cooldown
             state.reset()
-            info["blocked"] = True
-            return True, info
+            if self._cinematic_release_cooldown > 0:
+                info["blocked"] = True
+                return True, info
+            info["blocked"] = False
+            return False, info
 
         info["released_via"] = None
         info["blocked"] = True

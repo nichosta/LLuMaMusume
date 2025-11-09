@@ -1,29 +1,10 @@
-"""Utilities for detecting cinematic states from on-screen captures.
+"""Diff-focused cinematic detection heuristics."""
 
-The detector operates on successive captures, combining a lightweight frame
-difference metric with region-of-interest heuristics so we can distinguish
-between free-form gameplay and the two cinematic flavours seen in Uma Musume:
-
-* Fullscreen story cutscenes (menus/tabs suppressed, Skip appears after pausing)
-* Primary-region cutscenes (gacha pulls, Skip chip lives inside the primary pane)
-
-The logic is intentionally model-agnostic; callers feed in raw PIL images plus
-high-level hints (e.g. whether the menus pane is currently usable, the button
-labels returned by Vision).  The heuristics lean on three signals:
-
-1. Whether the bright “pin” control in the top-left corner is still visible.
-2. Variance/brightness in the tabs strip where the fullscreen Skip overlay lives.
-3. Variance/brightness in the primary bottom-right corner where gacha Skip chips appear.
-
-The detector tracks frame-to-frame deltas to tell “playing” from “paused” states
-while smoothing single-frame noise. The individual scores are exposed so a CLI
-or unit test harness can report them for tuning.
-"""
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 from PIL import Image
@@ -32,15 +13,15 @@ from lluma_os.config import CaptureConfig
 
 
 class CinematicKind(str, Enum):
-    """High-level categorisation of cinematic modes."""
+    """High-level classification for gating decisions."""
 
     NONE = "none"
-    FULLSCREEN = "fullscreen"
-    PRIMARY = "primary"
+    CUTSCENE = "cutscene"
+    LOADING = "loading"
 
 
 class PlaybackState(str, Enum):
-    """Whether a cinematic appears to be actively playing or paused."""
+    """Lightweight state machine for motion based on frame diffs."""
 
     UNKNOWN = "unknown"
     PLAYING = "playing"
@@ -58,18 +39,15 @@ class CinematicObservation:
 
 @dataclass(slots=True)
 class CinematicDetectionResult:
-    """Detector output for a single observation."""
+    """Detector output derived from successive frame comparisons."""
 
     kind: CinematicKind
     playback: PlaybackState
     diff_score: float
-    skip_hint_primary: bool
-    skip_hint_tabs: bool
-    skip_label_hint: bool
-    menu_unusable_streak: int
-    pin_present: bool
-    pin_bright_ratio: float
     primary_diff_score: float
+    changed_ratio: float
+    is_loading_screen: bool
+    aggressive_static: bool
 
 
 def _downscale_luma(image: Image.Image, *, width: int) -> np.ndarray:
@@ -80,148 +58,52 @@ def _downscale_luma(image: Image.Image, *, width: int) -> np.ndarray:
         height = max(1, int(round(image.height * ratio)))
         resized = image.resize((width, height), Image.BILINEAR)
     else:
-        resized = image.convert("L")
+        resized = image
     luma = np.asarray(resized.convert("L"), dtype=np.float32) / 255.0
     return luma
 
 
-def _roi_luma_stats(image: Image.Image, bounds: tuple[int, int, int, int]) -> tuple[float, float]:
-    """Return the normalised luma mean and standard deviation for a crop."""
-
-    x0, y0, x1, y1 = bounds
-    width, height = image.size
-    x0 = max(0, min(width, x0))
-    x1 = max(0, min(width, x1))
-    y0 = max(0, min(height, y0))
-    y1 = max(0, min(height, y1))
-    if x1 <= x0 or y1 <= y0:
-        return (0.0, 0.0)
-    crop = image.crop((x0, y0, x1, y1)).convert("L")
-    arr = np.asarray(crop, dtype=np.float32)
-    if arr.size == 0:
-        return (0.0, 0.0)
-    mean = float(arr.mean() / 255.0)
-    std = float(arr.std() / 255.0)
-    return (mean, std)
-
-
-def _normalise_labels(labels: Iterable[str]) -> list[str]:
-    """Lowercase and strip button labels for quick keyword checks."""
-
-    normalised = []
-    for label in labels:
-        clean = label.strip().lower()
-        if clean:
-            normalised.append(clean)
-    return normalised
-
-
-def _clamp_bounds(bounds: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
-    """Clamp rectangle bounds to the image dimensions."""
-
-    x0, y0, x1, y1 = bounds
-    x0 = max(0, min(width, x0))
-    x1 = max(0, min(width, x1))
-    y0 = max(0, min(height, y0))
-    y1 = max(0, min(height, y1))
-    if x1 <= x0 or y1 <= y0:
-        return (0, 0, 0, 0)
-    return (x0, y0, x1, y1)
-
-
 class CinematicDetector:
-    """Stateful helper that tracks whether we appear to be inside a cinematic."""
-
-    _PRIMARY_SKIP_X_START_RATIO = 0.85
-    _PRIMARY_SKIP_X_END_OFFSET_RATIO = 0.01
-    _PRIMARY_SKIP_Y_START_RATIO = 0.88
-    _PRIMARY_SKIP_Y_END_OFFSET_RATIO = 0.015
+    """Stateful helper that evaluates frame diffs to gate agent turns."""
 
     def __init__(
         self,
         capture_config: CaptureConfig,
         *,
+        poll_interval_s: float = 1.0,
         downscale_width: int = 256,
-        menu_unusable_streak_required: int = 2,
-        playing_diff_threshold: float = 0.05,
+        playing_diff_threshold: float = 0.02,
         paused_diff_threshold: float = 0.005,
-        tabs_skip_threshold: float = 0.08,
-        primary_skip_threshold: float = 0.18,
-        pin_bright_threshold: float = 0.5,
-        tabs_bright_threshold: float = 0.12,
-        primary_bright_threshold: float = 0.15,
-        tabs_bright_ratio_max: float = 0.7,
-        tabs_color_warmth_threshold: float = 0.05,
-        tabs_color_balance_max: float = 0.18,
-        primary_color_warmth_threshold: float = 0.08,
-        primary_color_balance_max: float = 0.22,
-        primary_bright_ratio_max: float = 1.0,
-        primary_bright_ratio_high_threshold: float = 0.4,
-        pin_std_threshold: float = 0.05,
-        pin_std_relaxed_threshold: float = 0.02,
-        pin_relaxed_mean_threshold: float = 0.8,
-        pin_relaxed_bright_ratio: float = 0.9,
-        primary_extra_bright_warmth_threshold: float = 0.12,
-        primary_extra_bright_color_min: float = 0.12,
+        change_threshold: float = 0.04,
+        bottom_region_ratio: float = 0.18,
+        bottom_bright_value: float = 0.6,
+        bottom_bright_ratio_threshold: float = 0.25,
+        bottom_change_ratio_max: float = 0.7,
+        loading_white_mean: float = 0.88,
+        loading_white_std: float = 0.12,
+        loading_white_bright_ratio: float = 0.6,
+        loading_black_mean: float = 0.08,
+        loading_black_std: float = 0.04,
+        loading_black_dark_ratio: float = 0.6,
     ) -> None:
-        """Initialise the detector.
-
-        Args:
-            capture_config: Capture configuration (used for split ratios).
-            downscale_width: Width to downscale frames to for diffing.
-            menu_unusable_streak_required: Number of consecutive frames with an
-                unusable menu pane before we assume fullscreen cinematics.
-            playing_diff_threshold: Mean absolute luma diff above which we treat
-                the frame as actively playing.
-            paused_diff_threshold: Mean absolute luma diff below which we treat
-                the frame as paused. Values between paused and playing are left
-                as UNKNOWN so callers can decide how cautiously to probe.
-            tabs_skip_threshold: Luma std-dev threshold in the tabs ROI that
-                indicates the Skip chip is visible after pausing a fullscreen
-                cinematic.
-            primary_skip_threshold: Equivalent threshold for the primary-region
-                Skip chip (gacha/key cinematics).
-            pin_std_threshold: Minimum variance required to treat the pin
-                control as confidently visible.
-            pin_std_relaxed_threshold: Reduced variance floor that still counts
-                as present when the region remains bright (e.g. modals fade the
-                pin).
-            pin_relaxed_mean_threshold: Mean luma required for the relaxed pin
-                path.
-            pin_relaxed_bright_ratio: Bright-pixel ratio required for the
-                relaxed pin path.
-            primary_extra_bright_warmth_threshold: Minimum colour warmth required
-                for the extra-bright fallback path when variance is low.
-            primary_extra_bright_color_min: Minimum colour range required for
-                the extra-bright fallback path when variance is low.
-        """
+        self.poll_interval_s = poll_interval_s
         self._capture_config = capture_config
         self._downscale_width = downscale_width
-        self._menu_unusable_streak_required = menu_unusable_streak_required
         self._playing_diff_threshold = playing_diff_threshold
         self._paused_diff_threshold = paused_diff_threshold
-        self._tabs_skip_threshold = tabs_skip_threshold
-        self._primary_skip_threshold = primary_skip_threshold
-        self._pin_bright_threshold = pin_bright_threshold
-        self._tabs_bright_threshold = tabs_bright_threshold
-        self._primary_bright_threshold = primary_bright_threshold
-        self._tabs_bright_ratio_max = tabs_bright_ratio_max
-        self._tabs_color_warmth_threshold = tabs_color_warmth_threshold
-        self._tabs_color_balance_max = tabs_color_balance_max
-        self._primary_color_warmth_threshold = primary_color_warmth_threshold
-        self._primary_color_balance_max = primary_color_balance_max
-        self._primary_bright_ratio_max = primary_bright_ratio_max
-        self._primary_bright_ratio_high_threshold = primary_bright_ratio_high_threshold
-        self._pin_std_threshold = pin_std_threshold
-        self._pin_std_relaxed_threshold = pin_std_relaxed_threshold
-        self._pin_relaxed_mean_threshold = pin_relaxed_mean_threshold
-        self._pin_relaxed_bright_ratio = pin_relaxed_bright_ratio
-        self._primary_extra_bright_warmth_threshold = primary_extra_bright_warmth_threshold
-        self._primary_extra_bright_color_min = primary_extra_bright_color_min
+        self._change_threshold = change_threshold
+        self._bottom_region_ratio = bottom_region_ratio
+        self._bottom_bright_value = bottom_bright_value
+        self._bottom_bright_ratio_threshold = bottom_bright_ratio_threshold
+        self._bottom_change_ratio_max = bottom_change_ratio_max
+        self._loading_white_mean = loading_white_mean
+        self._loading_white_std = loading_white_std
+        self._loading_white_bright_ratio = loading_white_bright_ratio
+        self._loading_black_mean = loading_black_mean
+        self._loading_black_std = loading_black_std
+        self._loading_black_dark_ratio = loading_black_dark_ratio
 
         self._prev_luma: Optional[np.ndarray] = None
-        self._prev_primary_luma: Optional[np.ndarray] = None
-        self._menu_unusable_streak = 0
 
     def observe(self, observation: CinematicObservation) -> CinematicDetectionResult:
         """Process a single frame and return the updated cinematic diagnosis."""
@@ -230,198 +112,99 @@ class CinematicDetector:
             raise TypeError("observation.image must be a PIL.Image.Image instance")
 
         luma = _downscale_luma(observation.image, width=self._downscale_width)
+        diff_map: Optional[np.ndarray]
         if self._prev_luma is None or self._prev_luma.shape != luma.shape:
             diff_score = 0.0
+            changed_ratio = 0.0
+            diff_map = None
         else:
-            diff_score = float(np.mean(np.abs(luma - self._prev_luma)))
+            diff_map = np.abs(luma - self._prev_luma)
+            diff_score = float(diff_map.mean())
+            changed_ratio = float((diff_map >= self._change_threshold).mean())
         self._prev_luma = luma
 
-        menu_hint = observation.menu_is_usable
-        if menu_hint is False:
-            self._menu_unusable_streak += 1
-        elif menu_hint is True:
-            self._menu_unusable_streak = 0
-
-        width, height = observation.image.size
-        split = self._capture_config.split
-        left_pin_px = int(round(width * split.left_pin_ratio))
-        primary_px = int(round(width * split.primary_ratio))
-        menus_px = int(round(width * split.menus_ratio))
-        primary_x0 = left_pin_px
-        primary_x1 = primary_x0 + primary_px
-        tabs_x0 = left_pin_px + primary_px + menus_px
-        tabs_x1 = width
-
-        tabs_skip_bounds = (
-            tabs_x0,
-            int(round(height * 0.7)),
-            tabs_x1,
-            height,
+        primary_diff_score = self._compute_primary_diff(diff_map)
+        is_loading_screen = self._detect_loading_screen(luma)
+        aggressive_static = self._detect_aggressive_static(
+            observation.menu_is_usable, luma, diff_map
         )
-        primary_skip_x0 = primary_x0 + int(round(primary_px * self._PRIMARY_SKIP_X_START_RATIO))
-        primary_skip_x1 = primary_x1 - int(round(primary_px * self._PRIMARY_SKIP_X_END_OFFSET_RATIO))
-        if primary_skip_x1 <= primary_skip_x0:
-            primary_skip_x1 = primary_x1
-        primary_skip_y0 = int(round(height * self._PRIMARY_SKIP_Y_START_RATIO))
-        primary_skip_y1 = height - int(round(height * self._PRIMARY_SKIP_Y_END_OFFSET_RATIO))
-        if primary_skip_y1 <= primary_skip_y0:
-            primary_skip_y1 = height
-        primary_skip_bounds = (primary_skip_x0, primary_skip_y0, primary_skip_x1, primary_skip_y1)
-        tabs_bounds = _clamp_bounds(tabs_skip_bounds, width, height)
-        tabs_crop = observation.image.crop(tabs_bounds).convert("L")
-        tabs_arr = np.asarray(tabs_crop, dtype=np.float32) / 255.0
-        tabs_color_warmth = 0.0
-        tabs_color_range = 0.0
-        if tabs_arr.size:
-            tabs_mean = float(tabs_arr.mean())
-            tabs_std = float(tabs_arr.std())
-            tabs_bright_ratio = float((tabs_arr >= 0.75).mean())
-            tabs_rgb = observation.image.crop(tabs_bounds).convert("RGB")
-            rgb_arr = np.asarray(tabs_rgb, dtype=np.float32) / 255.0
-            if rgb_arr.size:
-                channel_means = rgb_arr.reshape(-1, rgb_arr.shape[-1]).mean(axis=0)
-                tabs_color_warmth = float(channel_means[0] - channel_means[2])
-                tabs_color_range = float(channel_means.max() - channel_means.min())
+
+        if diff_score >= self._playing_diff_threshold:
+            playback = PlaybackState.PLAYING
+        elif diff_score <= self._paused_diff_threshold:
+            playback = PlaybackState.PAUSED
         else:
-            tabs_mean = tabs_std = tabs_bright_ratio = 0.0
-
-        primary_bounds = _clamp_bounds(primary_skip_bounds, width, height)
-        primary_crop = observation.image.crop(primary_bounds).convert("L")
-        primary_arr = np.asarray(primary_crop, dtype=np.float32) / 255.0
-        primary_color_warmth = 0.0
-        primary_color_range = 0.0
-        if primary_arr.size:
-            primary_mean = float(primary_arr.mean())
-            primary_std = float(primary_arr.std())
-            primary_bright_ratio = float((primary_arr >= 0.75).mean())
-            primary_rgb = observation.image.crop(primary_bounds).convert("RGB")
-            rgb_arr = np.asarray(primary_rgb, dtype=np.float32) / 255.0
-            if rgb_arr.size:
-                channel_means = rgb_arr.reshape(-1, rgb_arr.shape[-1]).mean(axis=0)
-                primary_color_warmth = float(channel_means[0] - channel_means[2])
-                primary_color_range = float(channel_means.max() - channel_means.min())
-            if self._prev_primary_luma is not None and self._prev_primary_luma.shape == primary_arr.shape:
-                primary_diff_score = float(np.mean(np.abs(primary_arr - self._prev_primary_luma)))
-            else:
-                primary_diff_score = 0.0
-            self._prev_primary_luma = primary_arr
-        else:
-            primary_mean = primary_std = primary_bright_ratio = 0.0
-            primary_diff_score = 0.0
-            self._prev_primary_luma = None
-
-        pin_width = max(1, int(round(width * self._capture_config.split.left_pin_ratio * 0.9)))
-        pin_height = max(1, int(round(height * 0.15)))
-        pin_bounds = _clamp_bounds((0, 0, pin_width, pin_height), width, height)
-        pin_mean, pin_std = _roi_luma_stats(observation.image, pin_bounds)
-        pin_crop = observation.image.crop(pin_bounds).convert("L")
-        pin_arr = np.asarray(pin_crop, dtype=np.float32) / 255.0
-        pin_bright_ratio = float((pin_arr >= 0.8).mean()) if pin_arr.size else 0.0
-        pin_variance_ok = pin_std >= self._pin_std_threshold
-        pin_relaxed_ok = (
-            pin_std >= self._pin_std_relaxed_threshold
-            and pin_mean >= self._pin_relaxed_mean_threshold
-            and pin_bright_ratio >= self._pin_relaxed_bright_ratio
-        )
-        pin_present = (
-            pin_bright_ratio >= self._pin_bright_threshold
-            and pin_mean >= 0.6
-            and (pin_variance_ok or pin_relaxed_ok)
-        )
-
-        labels_norm = _normalise_labels(observation.button_labels)
-        skip_label_hint = any("skip" in label for label in labels_norm)
-
-        menu_hint = observation.menu_is_usable
-        tabs_color_check = (
-            tabs_color_warmth >= self._tabs_color_warmth_threshold
-            or tabs_color_range <= self._tabs_color_balance_max
-        )
-        skip_hint_tabs = (
-            tabs_std >= self._tabs_skip_threshold
-            and tabs_bright_ratio >= self._tabs_bright_threshold
-            and tabs_bright_ratio <= self._tabs_bright_ratio_max
-            and tabs_color_check
-        )
-        primary_color_check = (
-            primary_color_warmth >= self._primary_color_warmth_threshold
-            or primary_color_range <= self._primary_color_balance_max
-        )
-        primary_variance_check = primary_std >= self._primary_skip_threshold
-        primary_brightness_check = primary_bright_ratio >= self._primary_bright_threshold
-        primary_extra_bright = primary_bright_ratio >= self._primary_bright_ratio_high_threshold
-        primary_extra_bright_ok = (
-            primary_extra_bright
-            and primary_color_check
-            and (
-                primary_color_warmth >= self._primary_extra_bright_warmth_threshold
-                or primary_color_range >= self._primary_extra_bright_color_min
-            )
-        )
-        skip_hint_primary = (
-            primary_brightness_check
-            and primary_bright_ratio <= self._primary_bright_ratio_max
-            and (
-                (primary_variance_check and primary_color_check)
-                or primary_extra_bright_ok
-            )
-        )
-        if skip_hint_primary:
-            if menu_hint is True and not skip_label_hint:
-                skip_hint_primary = False
-
-        if skip_label_hint:
-            if not skip_hint_tabs and not skip_hint_primary:
-                # Fall back to the most likely region if the heuristics are inconclusive.
-                skip_hint_primary = True
-
-        if skip_hint_tabs and skip_hint_primary:
-            primary_strength = primary_bright_ratio + primary_std
-            tabs_strength = tabs_bright_ratio + tabs_std
-            if primary_strength >= tabs_strength:
-                kind = CinematicKind.PRIMARY
-            else:
-                kind = CinematicKind.FULLSCREEN
-        elif skip_hint_tabs:
-            kind = CinematicKind.FULLSCREEN
-        elif skip_hint_primary:
-            kind = CinematicKind.PRIMARY
-        elif (
-            not pin_present
-            and (skip_hint_tabs or self._menu_unusable_streak >= self._menu_unusable_streak_required)
-        ):
-            kind = CinematicKind.FULLSCREEN
-        elif skip_hint_tabs:
-            kind = CinematicKind.FULLSCREEN
-        elif pin_present:
-            kind = CinematicKind.NONE
-        else:
-            kind = CinematicKind.NONE
-
-        if kind is CinematicKind.PRIMARY:
-            motion_score = max(primary_diff_score, diff_score)
-        else:
-            motion_score = diff_score
-
-        if kind is CinematicKind.NONE:
             playback = PlaybackState.UNKNOWN
+
+        if is_loading_screen:
+            kind = CinematicKind.LOADING
+        elif diff_map is not None and diff_score >= self._playing_diff_threshold and not aggressive_static:
+            kind = CinematicKind.CUTSCENE
         else:
-            if motion_score >= self._playing_diff_threshold:
-                playback = PlaybackState.PLAYING
-            elif motion_score <= self._paused_diff_threshold:
-                playback = PlaybackState.PAUSED
-            else:
-                playback = PlaybackState.UNKNOWN
+            kind = CinematicKind.NONE
 
         return CinematicDetectionResult(
             kind=kind,
             playback=playback,
             diff_score=diff_score,
-            skip_hint_primary=skip_hint_primary,
-            skip_hint_tabs=skip_hint_tabs,
-            skip_label_hint=skip_label_hint,
-            menu_unusable_streak=self._menu_unusable_streak,
-            pin_present=pin_present,
-            pin_bright_ratio=pin_bright_ratio,
             primary_diff_score=primary_diff_score,
+            changed_ratio=changed_ratio,
+            is_loading_screen=is_loading_screen,
+            aggressive_static=aggressive_static,
+        )
+
+    def _compute_primary_diff(self, diff_map: Optional[np.ndarray]) -> float:
+        if diff_map is None or diff_map.size == 0:
+            return 0.0
+        split = self._capture_config.split
+        width = diff_map.shape[1]
+        if not split.enabled:
+            return float(diff_map.mean())
+        left_pin_end = int(round(width * split.left_pin_ratio))
+        primary_end = int(round(width * (split.left_pin_ratio + split.primary_ratio)))
+        left_pin_end = max(0, min(left_pin_end, width))
+        primary_end = max(left_pin_end, min(primary_end, width))
+        primary_slice = diff_map[:, left_pin_end:primary_end]
+        if primary_slice.size == 0:
+            return float(diff_map.mean())
+        return float(primary_slice.mean())
+
+    def _detect_loading_screen(self, luma: np.ndarray) -> bool:
+        if luma.size == 0:
+            return False
+        mean = float(luma.mean())
+        std = float(luma.std())
+        bright_ratio = float((luma >= self._bottom_bright_value).mean())
+        dark_ratio = float((luma <= (1.0 - self._bottom_bright_value)).mean())
+        is_white_loading = (
+            mean >= self._loading_white_mean
+            and std <= self._loading_white_std
+            and bright_ratio >= self._loading_white_bright_ratio
+        )
+        is_black_loading = (
+            mean <= self._loading_black_mean
+            and std <= self._loading_black_std
+            and dark_ratio >= self._loading_black_dark_ratio
+        )
+        return is_white_loading or is_black_loading
+
+    def _detect_aggressive_static(
+        self,
+        menu_is_usable: Optional[bool],
+        luma: np.ndarray,
+        diff_map: Optional[np.ndarray],
+    ) -> bool:
+        if menu_is_usable:
+            return True
+        if diff_map is None or diff_map.size == 0:
+            return False
+        height = diff_map.shape[0]
+        bottom_rows = max(1, int(round(height * self._bottom_region_ratio)))
+        bottom_slice = diff_map[-bottom_rows:, :]
+        bottom_changed_ratio = float((bottom_slice >= self._change_threshold).mean())
+        bottom_luma = luma[-bottom_rows:, :]
+        bottom_bright_ratio = float((bottom_luma >= self._bottom_bright_value).mean())
+        return (
+            bottom_bright_ratio >= self._bottom_bright_ratio_threshold
+            and bottom_changed_ratio <= self._bottom_change_ratio_max
         )
