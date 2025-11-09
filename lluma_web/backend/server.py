@@ -6,7 +6,11 @@ import json
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-app = Flask(__name__, static_folder='../../frontend/build', static_url_path='/')
+# Construct the absolute path for the static folder
+script_dir = os.path.dirname(os.path.abspath(__file__))
+static_folder_path = os.path.abspath(os.path.join(script_dir, '..', 'frontend', 'build'))
+
+app = Flask(__name__, static_folder=static_folder_path, static_url_path='/')
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # In-memory state

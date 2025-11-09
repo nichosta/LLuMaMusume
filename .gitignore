@@ -1,6 +1,7 @@
 captures
 memory
 logs
+*.log
 **/__pycache__
 .venv
 .pytest_cache
