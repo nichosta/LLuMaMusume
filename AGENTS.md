@@ -179,8 +179,8 @@ agent:
     enabled: true                        # Enable/disable caching
     hash_distance_threshold: 8           # Perceptual hash Hamming distance tolerance (bits)
     max_age_turns: 10                    # Maximum cache age in turns
-    menu_force_refresh_interval: 5       # Force menu VLM refresh every N turns
-    primary_force_refresh_interval: 3    # Force primary VLM refresh every N turns
+    menu_force_refresh_interval: 5       # Force menu VLM refresh every N turns (0 disables)
+    primary_force_refresh_interval: 3    # Force primary VLM refresh every N turns (0 disables)
 ```
 
 **Performance**:

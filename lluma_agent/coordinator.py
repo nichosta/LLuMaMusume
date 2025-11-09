@@ -510,7 +510,10 @@ class GameLoopCoordinator:
             return True, current_hash, distance
 
         # Forced periodic refresh (handles VLM inaccuracy)
-        if self._menu_cache_consecutive_hits >= cache_config.menu_force_refresh_interval:
+        if (
+            cache_config.menu_force_refresh_interval > 0
+            and self._menu_cache_consecutive_hits >= cache_config.menu_force_refresh_interval
+        ):
             self._logger.info(
                 "Menu cache hit %d consecutive times; forcing periodic refresh",
                 self._menu_cache_consecutive_hits,
@@ -578,7 +581,10 @@ class GameLoopCoordinator:
             return True, current_hash, distance
 
         # Forced periodic refresh (handles VLM inaccuracy)
-        if self._primary_cache_consecutive_hits >= cache_config.primary_force_refresh_interval:
+        if (
+            cache_config.primary_force_refresh_interval > 0
+            and self._primary_cache_consecutive_hits >= cache_config.primary_force_refresh_interval
+        ):
             self._logger.info(
                 "Primary cache hit %d consecutive times; forcing periodic refresh",
                 self._primary_cache_consecutive_hits,
