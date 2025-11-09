@@ -61,7 +61,7 @@ function App() {
                     </section>
                     <section className="tool-calls">
                         <h3>Tool Calls</h3>
-                        <pre>{JSON.stringify(data.log?.tool_calls, null, 2) || 'No tool calls.'}</pre>
+                        <pre>{(data.log?.tool_calls && JSON.stringify(data.log.tool_calls, null, 2)) || 'No tool calls.'}</pre>
                     </section>
                 </div>
                 <div className="right-panel">
