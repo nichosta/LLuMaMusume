@@ -155,19 +155,60 @@ Notes:
 - Primary images are sent untrimmed.
 - Implementation: `lluma_vision/menu_analyzer.py`. Both calls reuse the same `OPENROUTER_API_KEY` that the agent uses.
 
+### Vision Caching
+
+To reduce VLM API costs and latency, the coordinator implements perceptual hash-based caching for both menu and primary regions. When screenshots are visually similar across turns, cached VLM results are reused instead of making new API calls.
+
+**Cache Strategy**:
+- **Perceptual hashing**: Each region image is hashed using average hash (aHash) from the `imagehash` library
+- **Similarity detection**: Hamming distance between hashes determines if images are similar enough to reuse results
+- **Separate caches**: Menu and primary regions maintain independent caches with different invalidation policies
+
+**Cache Invalidation** (any of these triggers a fresh VLM call):
+1. **Image changed**: Hash distance exceeds threshold (default: 8 bits)
+2. **Menu tab changed**: Menu cache invalidates when selected tab changes
+3. **Cache too old**: Age exceeds max (default: 10 turns)
+4. **Forced periodic refresh**: After N consecutive cache hits (menu: 5 turns, primary: 3 turns)
+
+The forced periodic refresh addresses VLM inaccuracy: even if images remain identical, fresh VLM calls are made every few turns to catch any detection errors and ensure results stay accurate.
+
+**Configuration** (`config.yaml`):
+```yaml
+agent:
+  vision_cache:
+    enabled: true                        # Enable/disable caching
+    hash_distance_threshold: 8           # Perceptual hash Hamming distance tolerance (bits)
+    max_age_turns: 10                    # Maximum cache age in turns
+    menu_force_refresh_interval: 5       # Force menu VLM refresh every N turns (0 disables)
+    primary_force_refresh_interval: 3    # Force primary VLM refresh every N turns (0 disables)
+```
+
+**Performance**:
+- Expected cache hit rate: 60-80% for menus, 30-50% for primary (menus change less frequently)
+- Cost savings: ~$0.001-0.002 per cached turn
+- Latency savings: ~1-2s per cached turn (no VLM round-trip)
+- Statistics logged at session end showing VLM calls, cache hits, hit rates, and forced refreshes
+
+**Implementation details**:
+- Hash computation: `MenuAnalyzer.compute_perceptual_hash()` using `imagehash.average_hash(image, hash_size=8)`
+- Cache decision: `Coordinator._should_refresh_menu_cache()` and `_should_refresh_primary_cache()`
+- Metrics: Tracked in coordinator state (`_menu_vlm_calls`, `_menu_cache_hits`, etc.)
+- Fallback: If `imagehash` unavailable, caching is automatically disabled and VLM is called every turn
+
 ### Image Processing Stack
 
 Current runtime deps
 - `pillow`: save PNG captures, crop primary/menus/tabs, re-open files for base64 encoding.
 - `numpy`: Laplacian sharpness scores, tab-availability heuristics, and scrollbar gradient math.
 - `requests`: direct OpenRouter calls (both for VLM and for the agent).
+- `imagehash`: perceptual hashing for vision caching (optional; caching disabled if unavailable).
 
 Processing today is intentionally minimal:
 - No denoise, CLAHE, or gamma tweaks are applied; we rely on the VLM’s robustness.
 - Menu crops are trimmed on the left via `LEFT_TRIM_RATIO` before encoding; the actual trim ratio is propagated so the coordinator can adjust button bounds. If the trimmed query returns no detections but was parsed successfully, we retry without trimming. If the response JSON is invalid we retry once with the same trim before giving up.
 - Scrollbar detection inspects the rightmost band of the primary crop in raw RGB space.
 
-Optional packages (`opencv-python-headless`, `scikit-image`, `ImageHash`, `pytesseract`, etc.) are kept in reserve for future experiments but are not imported by default.
+Optional packages (`opencv-python-headless`, `scikit-image`, `pytesseract`, etc.) are kept in reserve for future experiments but are not imported by default.
 
 # Agent
 

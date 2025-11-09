@@ -27,3 +27,11 @@ agent:
   thinking_budget_tokens: 12000          # Max tokens for internal reasoning (min 1024)
   max_tokens: 16000                      # Max output tokens (must exceed thinking_budget_tokens)
   summarization_threshold_tokens: 64000  # Trigger summarization when prompt size exceeds this (0 = disabled)
+
+  # Vision caching configuration (reduces VLM API calls when screens are similar)
+  vision_cache:
+    enabled: true                        # Enable perceptual hash-based caching
+    hash_distance_threshold: 8           # Perceptual hash Hamming distance tolerance (bits)
+    max_age_turns: 10                    # Maximum cache age in turns
+    menu_force_refresh_interval: 5       # Force VLM refresh every N turns for menu region (0 disables)
+    primary_force_refresh_interval: 3    # Force VLM refresh every N turns for primary region (0 disables)

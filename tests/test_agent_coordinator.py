@@ -6,11 +6,12 @@ from types import SimpleNamespace
 from PIL import Image
 
 from lluma_agent.coordinator import (
+    GameLoopCoordinator,
     calculate_primary_center,
     calculate_region_offset,
     convert_vlm_box_to_pixels,
 )
-from lluma_os.config import CaptureConfig
+from lluma_os.config import CaptureConfig, VisionCacheConfig
 from lluma_os.window import ClientArea, Rect, WindowGeometry
 
 
@@ -67,4 +68,122 @@ def test_calculate_primary_center_without_primary_image() -> None:
         geometry.client_area.width_logical // 2,
         geometry.client_area.height_logical // 2,
     )
+
+
+class _StubVision:
+    def __init__(self, hash_value: str = "hash", distance: int = 0) -> None:
+        self.hash_value = hash_value
+        self.distance = distance
+
+    def compute_perceptual_hash(self, image: Image.Image) -> str:
+        return self.hash_value
+
+    def hash_distance(self, hash1: str, hash2: str) -> int:
+        return self.distance
+
+
+class _StubLogger:
+    def debug(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - trivial
+        return None
+
+    def info(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - trivial
+        return None
+
+    def warning(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - trivial
+        return None
+
+    def error(self, *args: object, **kwargs: object) -> None:  # pragma: no cover - trivial
+        return None
+
+
+def _make_coordinator_for_cache_tests(
+    *,
+    menu_hits: int = 0,
+    primary_hits: int = 0,
+    distance: int = 0,
+) -> GameLoopCoordinator:
+    coordinator = object.__new__(GameLoopCoordinator)
+    cache_config = VisionCacheConfig()
+    cache_config.hash_distance_threshold = 8
+    cache_config.max_age_turns = 10
+    cache_config.menu_force_refresh_interval = 0
+    cache_config.primary_force_refresh_interval = 0
+
+    coordinator._vision = _StubVision(distance=distance)  # type: ignore[attr-defined]
+    coordinator._agent_config = SimpleNamespace(vision_cache=cache_config)  # type: ignore[attr-defined]
+
+    coordinator._menu_cache_hash = "hash"  # type: ignore[attr-defined]
+    coordinator._menu_cache_turn = 5  # type: ignore[attr-defined]
+    coordinator._menu_cache_consecutive_hits = menu_hits  # type: ignore[attr-defined]
+    coordinator._menu_cache_forced_refresh = 0  # type: ignore[attr-defined]
+    coordinator._last_menu_tab = "Tab"  # type: ignore[attr-defined]
+
+    coordinator._primary_cache_hash = "hash"  # type: ignore[attr-defined]
+    coordinator._primary_cache_turn = 5  # type: ignore[attr-defined]
+    coordinator._primary_cache_consecutive_hits = primary_hits  # type: ignore[attr-defined]
+    coordinator._primary_cache_forced_refresh = 0  # type: ignore[attr-defined]
+    coordinator._primary_cache_buttons_raw = []  # type: ignore[attr-defined]
+    coordinator._logger = _StubLogger()  # type: ignore[attr-defined]
+
+    return coordinator
+
+
+def test_menu_force_refresh_zero_disables_periodic_refresh() -> None:
+    coordinator = _make_coordinator_for_cache_tests()
+
+    should_call_vlm, current_hash, distance = coordinator._should_refresh_menu_cache(  # type: ignore[attr-defined]
+        Image.new("RGB", (4, 4)),
+        "Tab",
+        current_turn=6,
+    )
+
+    assert should_call_vlm is False
+    assert current_hash == "hash"
+    assert distance == 0
+    assert coordinator._menu_cache_forced_refresh == 0  # type: ignore[attr-defined]
+
+
+def test_menu_force_refresh_triggers_when_interval_reached() -> None:
+    coordinator = _make_coordinator_for_cache_tests(menu_hits=2)
+    coordinator._agent_config.vision_cache.menu_force_refresh_interval = 2  # type: ignore[attr-defined]
+
+    should_call_vlm, current_hash, distance = coordinator._should_refresh_menu_cache(  # type: ignore[attr-defined]
+        Image.new("RGB", (4, 4)),
+        "Tab",
+        current_turn=6,
+    )
+
+    assert should_call_vlm is True
+    assert current_hash == "hash"
+    assert distance == 0
+    assert coordinator._menu_cache_forced_refresh == 1  # type: ignore[attr-defined]
+
+
+def test_primary_force_refresh_zero_disables_periodic_refresh() -> None:
+    coordinator = _make_coordinator_for_cache_tests()
+
+    should_call_vlm, current_hash, distance = coordinator._should_refresh_primary_cache(  # type: ignore[attr-defined]
+        Image.new("RGB", (4, 4)),
+        current_turn=6,
+    )
+
+    assert should_call_vlm is False
+    assert current_hash == "hash"
+    assert distance == 0
+    assert coordinator._primary_cache_forced_refresh == 0  # type: ignore[attr-defined]
+
+
+def test_primary_force_refresh_triggers_when_interval_reached() -> None:
+    coordinator = _make_coordinator_for_cache_tests(primary_hits=3)
+    coordinator._agent_config.vision_cache.primary_force_refresh_interval = 3  # type: ignore[attr-defined]
+
+    should_call_vlm, current_hash, distance = coordinator._should_refresh_primary_cache(  # type: ignore[attr-defined]
+        Image.new("RGB", (4, 4)),
+        current_turn=6,
+    )
+
+    assert should_call_vlm is True
+    assert current_hash == "hash"
+    assert distance == 0
+    assert coordinator._primary_cache_forced_refresh == 1  # type: ignore[attr-defined]
 

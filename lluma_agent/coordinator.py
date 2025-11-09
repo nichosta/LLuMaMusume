@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from PIL import Image
+
 from lluma_os.capture import CaptureManager, CaptureError
 from lluma_os.config import AgentConfig, CaptureConfig, WindowConfig
 from lluma_os.input_handler import (
@@ -178,9 +180,26 @@ class GameLoopCoordinator:
         self._turn_counter = 0
         self._interrupt_count = 0
 
-        # Cache for menu button results (reuse if tab hasn't changed and VLM fails)
+        # Legacy cache for menu button results (reuse if tab hasn't changed and VLM fails)
         self._last_menu_tab: Optional[str] = None
         self._last_menu_buttons_raw: List[Dict[str, Any]] = []
+
+        # Perceptual hash-based vision cache (menu region)
+        self._menu_cache_hash: Optional[str] = None
+        self._menu_cache_turn: int = 0
+        self._menu_cache_consecutive_hits: int = 0
+        self._menu_vlm_calls: int = 0
+        self._menu_cache_hits: int = 0
+        self._menu_cache_forced_refresh: int = 0
+
+        # Perceptual hash-based vision cache (primary region)
+        self._primary_cache_hash: Optional[str] = None
+        self._primary_cache_turn: int = 0
+        self._primary_cache_consecutive_hits: int = 0
+        self._primary_cache_buttons_raw: List[Dict[str, Any]] = []
+        self._primary_vlm_calls: int = 0
+        self._primary_cache_hits: int = 0
+        self._primary_cache_forced_refresh: int = 0
 
         # Cache for full vision objects (needed by input handler, not serialized in logs)
         self._current_scrollbar_full: Optional[Any] = None  # ScrollbarInfo
@@ -265,7 +284,39 @@ class GameLoopCoordinator:
             self._logger.exception("Unhandled exception in game loop: %s", exc)
             raise CoordinatorError("Game loop failed") from exc
         finally:
+            self._log_cache_stats()
             self._logger.info("Game loop terminated")
+
+    def _log_cache_stats(self) -> None:
+        """Log vision cache statistics at session end."""
+        if self._turn_counter == 0:
+            return
+
+        # Menu cache stats
+        menu_total = self._menu_vlm_calls + self._menu_cache_hits
+        menu_hit_rate = (self._menu_cache_hits / menu_total * 100) if menu_total > 0 else 0.0
+
+        # Primary cache stats
+        primary_total = self._primary_vlm_calls + self._primary_cache_hits
+        primary_hit_rate = (self._primary_cache_hits / primary_total * 100) if primary_total > 0 else 0.0
+
+        self._logger.info("=" * 60)
+        self._logger.info("Vision Cache Statistics (across %d turns)", self._turn_counter)
+        self._logger.info(
+            "Menu Region:    %3d VLM calls, %3d cache hits, %5.1f%% hit rate, %d forced refreshes",
+            self._menu_vlm_calls,
+            self._menu_cache_hits,
+            menu_hit_rate,
+            self._menu_cache_forced_refresh,
+        )
+        self._logger.info(
+            "Primary Region: %3d VLM calls, %3d cache hits, %5.1f%% hit rate, %d forced refreshes",
+            self._primary_vlm_calls,
+            self._primary_cache_hits,
+            primary_hit_rate,
+            self._primary_cache_forced_refresh,
+        )
+        self._logger.info("=" * 60)
 
     def _execute_turn(self, reposition: bool = False) -> None:
         """Execute a single turn of the game loop.
@@ -407,6 +458,149 @@ class GameLoopCoordinator:
             )
         return None
 
+    def _should_refresh_menu_cache(
+        self, image: Image.Image, current_tab: Optional[str], current_turn: int
+    ) -> tuple[bool, Optional[str], int]:
+        """Determine if menu VLM should be called or cache reused.
+
+        Args:
+            image: Current menu image
+            current_tab: Currently selected tab
+            current_turn: Current turn number
+
+        Returns:
+            Tuple of (should_call_vlm, image_hash, hash_distance)
+        """
+        cache_config = self._agent_config.vision_cache
+
+        # If caching disabled, always refresh
+        if not cache_config.enabled:
+            return True, None, 999
+
+        # Compute perceptual hash
+        current_hash = self._vision.compute_perceptual_hash(image)
+        if current_hash is None:
+            # imagehash unavailable, always refresh
+            return True, None, 999
+
+        # First turn or tab changed: always refresh
+        if self._menu_cache_hash is None or current_tab != self._last_menu_tab:
+            return True, current_hash, 999
+
+        # Compute hash distance
+        distance = self._vision.hash_distance(current_hash, self._menu_cache_hash)
+
+        # Hard invalidation: image changed significantly
+        if distance > cache_config.hash_distance_threshold:
+            self._logger.debug(
+                "Menu image hash distance %d exceeds threshold %d; refreshing VLM",
+                distance,
+                cache_config.hash_distance_threshold,
+            )
+            return True, current_hash, distance
+
+        # Hard invalidation: cache too old
+        cache_age = current_turn - self._menu_cache_turn
+        if cache_age > cache_config.max_age_turns:
+            self._logger.debug(
+                "Menu cache age %d turns exceeds max %d; refreshing VLM",
+                cache_age,
+                cache_config.max_age_turns,
+            )
+            return True, current_hash, distance
+
+        # Forced periodic refresh (handles VLM inaccuracy)
+        if (
+            cache_config.menu_force_refresh_interval > 0
+            and self._menu_cache_consecutive_hits >= cache_config.menu_force_refresh_interval
+        ):
+            self._logger.info(
+                "Menu cache hit %d consecutive times; forcing periodic refresh",
+                self._menu_cache_consecutive_hits,
+            )
+            self._menu_cache_forced_refresh += 1
+            return True, current_hash, distance
+
+        # All checks passed: use cache
+        self._logger.debug(
+            "Menu cache valid (hash distance: %d, age: %d turns, consecutive hits: %d); reusing",
+            distance,
+            cache_age,
+            self._menu_cache_consecutive_hits,
+        )
+        return False, current_hash, distance
+
+    def _should_refresh_primary_cache(
+        self, image: Image.Image, current_turn: int
+    ) -> tuple[bool, Optional[str], int]:
+        """Determine if primary VLM should be called or cache reused.
+
+        Args:
+            image: Current primary image
+            current_turn: Current turn number
+
+        Returns:
+            Tuple of (should_call_vlm, image_hash, hash_distance)
+        """
+        cache_config = self._agent_config.vision_cache
+
+        # If caching disabled, always refresh
+        if not cache_config.enabled:
+            return True, None, 999
+
+        # Compute perceptual hash
+        current_hash = self._vision.compute_perceptual_hash(image)
+        if current_hash is None:
+            # imagehash unavailable, always refresh
+            return True, None, 999
+
+        # First turn: always refresh
+        if self._primary_cache_hash is None:
+            return True, current_hash, 999
+
+        # Compute hash distance
+        distance = self._vision.hash_distance(current_hash, self._primary_cache_hash)
+
+        # Hard invalidation: image changed significantly
+        if distance > cache_config.hash_distance_threshold:
+            self._logger.debug(
+                "Primary image hash distance %d exceeds threshold %d; refreshing VLM",
+                distance,
+                cache_config.hash_distance_threshold,
+            )
+            return True, current_hash, distance
+
+        # Hard invalidation: cache too old
+        cache_age = current_turn - self._primary_cache_turn
+        if cache_age > cache_config.max_age_turns:
+            self._logger.debug(
+                "Primary cache age %d turns exceeds max %d; refreshing VLM",
+                cache_age,
+                cache_config.max_age_turns,
+            )
+            return True, current_hash, distance
+
+        # Forced periodic refresh (handles VLM inaccuracy)
+        if (
+            cache_config.primary_force_refresh_interval > 0
+            and self._primary_cache_consecutive_hits >= cache_config.primary_force_refresh_interval
+        ):
+            self._logger.info(
+                "Primary cache hit %d consecutive times; forcing periodic refresh",
+                self._primary_cache_consecutive_hits,
+            )
+            self._primary_cache_forced_refresh += 1
+            return True, current_hash, distance
+
+        # All checks passed: use cache
+        self._logger.debug(
+            "Primary cache valid (hash distance: %d, age: %d turns, consecutive hits: %d); reusing",
+            distance,
+            cache_age,
+            self._primary_cache_consecutive_hits,
+        )
+        return False, current_hash, distance
+
     def _process_vision(self, capture_result: Any, *, menu_state: Optional[MenuState] = None) -> VisionData:
         """Process vision data from capture results.
 
@@ -449,27 +643,51 @@ class GameLoopCoordinator:
                 "available": menu_state_obj.available_tabs(),
             }
 
-            # Button detection in menus
+            # Button detection in menus (with perceptual hash-based caching)
             if menu_state_obj.is_usable:
-                menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                # Check if we should call VLM or use cache
+                should_call_vlm, current_hash, hash_dist = self._should_refresh_menu_cache(
+                    capture_result.menus_image,
+                    menu_state_obj.selected_tab,
+                    self._turn_counter,
+                )
 
-                # If VLM returned no buttons but tab hasn't changed, reuse previous results
-                if (
-                    not menu_buttons_raw
-                    and menu_state_obj.selected_tab is not None
-                    and menu_state_obj.selected_tab == self._last_menu_tab
-                    and self._last_menu_buttons_raw
-                ):
-                    self._logger.info(
-                        "Menu VLM returned no buttons for tab '%s'; reusing %d buttons from previous turn",
-                        menu_state_obj.selected_tab,
-                        len(self._last_menu_buttons_raw),
-                    )
+                if should_call_vlm:
+                    # Call VLM for fresh detection
+                    menu_buttons_raw = self._vision.get_clickable_buttons(str(capture_result.menus_path))
+                    self._menu_vlm_calls += 1
+
+                    # Legacy fallback: If VLM returned no buttons but tab hasn't changed, try previous results
+                    if (
+                        not menu_buttons_raw
+                        and menu_state_obj.selected_tab is not None
+                        and menu_state_obj.selected_tab == self._last_menu_tab
+                        and self._last_menu_buttons_raw
+                    ):
+                        self._logger.info(
+                            "Menu VLM returned no buttons for tab '%s'; reusing %d buttons from previous turn",
+                            menu_state_obj.selected_tab,
+                            len(self._last_menu_buttons_raw),
+                        )
+                        menu_buttons_raw = self._last_menu_buttons_raw
+
+                    # Update cache with fresh results
+                    self._menu_cache_hash = current_hash
+                    self._menu_cache_turn = self._turn_counter
+                    self._menu_cache_consecutive_hits = 0
+                    self._last_menu_tab = menu_state_obj.selected_tab
+                    self._last_menu_buttons_raw = menu_buttons_raw
+                else:
+                    # Reuse cached results
                     menu_buttons_raw = self._last_menu_buttons_raw
-
-                # Update cache for next turn
-                self._last_menu_tab = menu_state_obj.selected_tab
-                self._last_menu_buttons_raw = menu_buttons_raw
+                    self._menu_cache_hits += 1
+                    self._menu_cache_consecutive_hits += 1
+                    self._logger.info(
+                        "Menu cache HIT (hash dist: %d) - reusing %d buttons from turn %d",
+                        hash_dist,
+                        len(menu_buttons_raw),
+                        self._menu_cache_turn,
+                    )
 
                 # Images are in physical pixels, convert to logical for coordinate system
                 menus_width_physical, menus_height_physical = capture_result.menus_image.size
@@ -509,6 +727,8 @@ class GameLoopCoordinator:
                 # Menu not usable; clear caches
                 self._last_menu_tab = None
                 self._last_menu_buttons_raw = []
+                self._menu_cache_hash = None
+                self._menu_cache_consecutive_hits = 0
                 self._current_menu_state_full = None
         else:
             menu_state_obj = None
@@ -516,8 +736,34 @@ class GameLoopCoordinator:
 
         # Process primary region
         if capture_result.primary_path and capture_result.primary_path.exists():
-            # Button detection
-            primary_buttons_raw = self._vision.get_primary_elements(str(capture_result.primary_path))
+            # Button detection (with perceptual hash-based caching)
+            should_call_vlm, current_hash, hash_dist = self._should_refresh_primary_cache(
+                capture_result.primary_image,
+                self._turn_counter,
+            )
+
+            if should_call_vlm:
+                # Call VLM for fresh detection
+                primary_buttons_raw = self._vision.get_primary_elements(str(capture_result.primary_path))
+                self._primary_vlm_calls += 1
+
+                # Update cache with fresh results
+                self._primary_cache_hash = current_hash
+                self._primary_cache_turn = self._turn_counter
+                self._primary_cache_consecutive_hits = 0
+                self._primary_cache_buttons_raw = primary_buttons_raw
+            else:
+                # Reuse cached results
+                primary_buttons_raw = self._primary_cache_buttons_raw
+                self._primary_cache_hits += 1
+                self._primary_cache_consecutive_hits += 1
+                self._logger.info(
+                    "Primary cache HIT (hash dist: %d) - reusing %d buttons from turn %d",
+                    hash_dist,
+                    len(primary_buttons_raw),
+                    self._primary_cache_turn,
+                )
+
             # Images are in physical pixels, convert to logical for coordinate system
             primary_width_physical, primary_height_physical = capture_result.primary_image.size
             scaling_factor = capture_result.geometry.client_area.scaling_factor

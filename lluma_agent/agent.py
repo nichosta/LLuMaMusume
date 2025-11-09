@@ -91,6 +91,11 @@ class UmaAgent:
         # Track memory state for cache invalidation
         self._memory_content_hash: Optional[str] = None
 
+        # Stable cache boundary for historical messages
+        # This tracks the index of the last message we've cached
+        # We only move this forward in increments to keep cached content stable
+        self._stable_cache_boundary: int = 0
+
         # Initialize Anthropic API client
         self._init_api()
 
@@ -224,11 +229,13 @@ class UmaAgent:
                 usage["cache_read_input_tokens"] = cache_read
 
             # Log with cache statistics
-            # Note: input_tokens includes both new tokens and cache creation tokens
-            # cache_read_input_tokens is separate and billed at a much lower rate
-            billable_input = usage["input_tokens"]
-            total_processed = billable_input + cache_read
-            uncached_new = billable_input - cache_creation  # New tokens (not written to cache)
+            # Per Anthropic docs: input_tokens, cache_creation_input_tokens, and cache_read_input_tokens
+            # are SEPARATE counts (not overlapping). Total = input + cache_creation + cache_read
+            # - input_tokens: Only tokens AFTER the last cache breakpoint (uncached new tokens)
+            # - cache_creation_input_tokens: Tokens written to cache
+            # - cache_read_input_tokens: Tokens read from cache (billed at lower rate)
+            uncached_new = usage["input_tokens"]  # Already represents uncached tokens
+            total_processed = uncached_new + cache_creation + cache_read
 
             if cache_read > 0 or cache_creation > 0:
                 cache_hit_rate = (cache_read / total_processed * 100) if total_processed > 0 else 0
@@ -309,9 +316,13 @@ class UmaAgent:
 
         Cache strategy:
         1. System prompt: Always cached (set in system_blocks)
-        2. Message history prefix: Cache older messages (all but last 3)
+        2. Message history prefix: Cache using STABLE boundary that only moves forward in increments
         3. Memory content: Cache when stable (tracked via hash)
         4. Current turn: Never cached (changes every turn)
+
+        The stable boundary ensures cached content remains identical across turns,
+        enabling cache hits. We only move the boundary forward when we accumulate
+        enough new messages (5+ beyond current boundary).
 
         Args:
             historical_messages: List of previous turn messages
@@ -323,10 +334,19 @@ class UmaAgent:
         """
         messages = []
 
-        # Add historical messages with cache breakpoint after stable prefix
-        # Keep last 3 messages uncached (they're more likely to be referenced)
         num_history = len(historical_messages)
-        cache_cutoff = max(0, num_history - 3)
+
+        # Update stable cache boundary: only move forward when we have enough new messages
+        # Keep last 3 messages uncached for flexibility
+        # Move boundary forward in increments of 5 to maintain stability
+        max_cacheable = max(0, num_history - 3)
+        if max_cacheable >= self._stable_cache_boundary + 5:
+            # Enough new messages accumulated; move boundary forward by 5
+            self._stable_cache_boundary = max_cacheable
+            self._logger.info("Advanced cache boundary to message %d (total history: %d)",
+                            self._stable_cache_boundary, num_history)
+
+        cache_cutoff = self._stable_cache_boundary
 
         for i, msg in enumerate(historical_messages):
             # Copy message
@@ -776,8 +796,10 @@ New turns will continue below this summary."""
                 }
             ]
 
+            # Reset cache boundary since message history was replaced
+            self._stable_cache_boundary = 0
             self._logger.info(
-                "Summarization complete: %d messages → 1 summary message",
+                "Summarization complete: %d messages → 1 summary message (cache boundary reset)",
                 old_message_count
             )
 
