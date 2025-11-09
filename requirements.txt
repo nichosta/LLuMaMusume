@@ -10,6 +10,9 @@ anthropic
 Flask
 Flask-SocketIO
 ImageHash
+Flask
+Flask-SocketIO
+watchdog
 
 # Optional (uncomment as needed)
 # keyboard
