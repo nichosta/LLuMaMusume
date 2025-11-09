@@ -586,6 +586,10 @@ class GameLoopCoordinator:
             "skip_hint_tabs": detection.skip_hint_tabs,
             "pin_present": detection.pin_present,
             "menu_unusable_streak": detection.menu_unusable_streak,
+            "loading_screen": detection.loading_screen,
+            "anchor_stable_regions": detection.anchor_stable_regions,
+            "anchor_stable_ratio": detection.anchor_stable_ratio,
+            "anchor_max_diff": detection.anchor_max_diff,
             "buffer_turns_remaining": max(self._cinematic_release_cooldown, 0),
         }
 
@@ -639,21 +643,11 @@ class GameLoopCoordinator:
             detection.playback is PlaybackState.PAUSED
             and state.low_motion_frames >= self._cinematic_min_low_frames
         )
-        release_due_to_pin = (
-            detection.kind is CinematicKind.FULLSCREEN and detection.pin_present
-        )
-        release_due_to_primary_clear = (
-            detection.kind is CinematicKind.PRIMARY and not detection.skip_hint_primary
-        )
         release_due_to_timeout = hold_turns >= self._cinematic_max_hold_turns
 
         release_reason: Optional[str] = None
         if release_due_to_low_motion:
             release_reason = "low_motion"
-        elif release_due_to_pin:
-            release_reason = "pin_returned"
-        elif release_due_to_primary_clear:
-            release_reason = "primary_skip_cleared"
         elif release_due_to_timeout:
             release_reason = "timeout"
 
