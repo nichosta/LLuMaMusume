@@ -9,6 +9,7 @@ pytest
 anthropic
 Flask
 Flask-SocketIO
+ImageHash
 
 # Optional (uncomment as needed)
 # keyboard
@@ -17,5 +18,4 @@ Flask-SocketIO
 # tenacity
 # opencv-python-headless
 # scikit-image
-# ImageHash
 # pytesseract

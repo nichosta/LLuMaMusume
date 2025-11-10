@@ -108,10 +108,9 @@ def _format_result(path: Path, result) -> str:
         f" playback={result.playback.value:7s}"
         f" diff={result.diff_score:0.4f}"
         f" primary_diff={result.primary_diff_score:0.4f}"
-        f" skip_primary={int(result.skip_hint_primary)}"
-        f" skip_tabs={int(result.skip_hint_tabs)}"
-        f" skip_label={int(result.skip_label_hint)}"
-        f" pin_present={int(result.pin_present)}"
+        f" loading={int(result.loading_screen)}"
+        f" anchors={result.anchor_stable_regions}"
+        f" anchor_ratio={result.anchor_stable_ratio:0.2f}"
         f" menu_streak={result.menu_unusable_streak}"
     )
 
@@ -155,11 +154,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 "playback": result.playback.value,
                 "diff_score": result.diff_score,
                 "primary_diff_score": result.primary_diff_score,
-                "skip_hint_primary": result.skip_hint_primary,
-                "skip_hint_tabs": result.skip_hint_tabs,
-                "skip_label_hint": result.skip_label_hint,
-                "pin_present": result.pin_present,
-                "pin_bright_ratio": result.pin_bright_ratio,
+                "loading_screen": result.loading_screen,
+                "anchor_stable_regions": result.anchor_stable_regions,
+                "anchor_stable_ratio": result.anchor_stable_ratio,
+                "anchor_max_diff": result.anchor_max_diff,
                 "menu_unusable_streak": result.menu_unusable_streak,
             }
             print(json.dumps(payload))

@@ -16,6 +16,12 @@ import requests
 from numpy.lib.stride_tricks import sliding_window_view
 from PIL import Image
 
+try:
+    import imagehash
+    IMAGEHASH_AVAILABLE = True
+except ImportError:
+    IMAGEHASH_AVAILABLE = False
+
 Logger = logging.Logger
 
 
@@ -88,6 +94,48 @@ class MenuAnalyzer:
         self._logger = logger or logging.getLogger(__name__)
         self._api_key: Optional[str] = None
         self._headers: Optional[Dict[str, str]] = None
+
+    def compute_perceptual_hash(self, image: Image.Image) -> Optional[str]:
+        """Compute perceptual hash of an image for similarity detection.
+
+        Args:
+            image: PIL Image to hash
+
+        Returns:
+            Hex string representation of perceptual hash, or None if imagehash unavailable
+        """
+        if not IMAGEHASH_AVAILABLE:
+            self._logger.warning("imagehash not available; vision caching will be disabled")
+            return None
+
+        try:
+            # Use average hash (aHash) - fast and reliable for UI screenshots
+            phash = imagehash.average_hash(image, hash_size=8)
+            return str(phash)
+        except Exception as exc:
+            self._logger.error("Failed to compute perceptual hash: %s", exc)
+            return None
+
+    def hash_distance(self, hash1: str, hash2: str) -> int:
+        """Compute Hamming distance between two perceptual hashes.
+
+        Args:
+            hash1: First hash (hex string)
+            hash2: Second hash (hex string)
+
+        Returns:
+            Hamming distance in bits (0 = identical, 64 = completely different for 8x8 hash)
+        """
+        if not IMAGEHASH_AVAILABLE:
+            return 999  # Large distance to force refresh
+
+        try:
+            h1 = imagehash.hex_to_hash(hash1)
+            h2 = imagehash.hex_to_hash(hash2)
+            return h1 - h2  # Returns Hamming distance
+        except Exception as exc:
+            self._logger.error("Failed to compute hash distance: %s", exc)
+            return 999  # Large distance to force refresh
 
     def analyze_menu(self, menu_image: Image.Image, tabs_image: Optional[Image.Image] = None) -> MenuState:
         """Analyze a menu section image and return the menu state.
