@@ -1,0 +1,104 @@
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen',
+        'Ubuntu', 'Cantarell', 'Fira Sans', 'Droid Sans', 'Helvetica Neue',
+        sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background-color: #282c34;
+    color: white;
+    margin: 0;
+    padding: 20px;
+}
+
+.App {
+    text-align: center;
+}
+
+.App-header {
+    margin-bottom: 2rem;
+}
+
+.container {
+    display: flex;
+    flex-direction: row;
+    justify-content: space-around;
+    gap: 20px;
+}
+
+.left-panel, .right-panel {
+    width: 48%;
+    text-align: left;
+}
+
+section {
+    background-color: #3a3f4a;
+    padding: 20px;
+    border-radius: 8px;
+    margin-bottom: 20px;
+}
+
+h3 {
+    border-bottom: 2px solid #61dafb;
+    padding-bottom: 10px;
+    margin-top: 0;
+}
+
+pre {
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    background-color: #20232a;
+    padding: 15px;
+    border-radius: 5px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.screenshot img {
+    width: 100%;
+    border-radius: 5px;
+}
+
+.memory-files ul {
+    list-style-type: none;
+    padding: 0;
+}
+
+.memory-files li {
+    margin-bottom: 10px;
+}
+
+.memory-files button {
+    background: none;
+    border: 1px solid #61dafb;
+    color: #61dafb;
+    padding: 8px 12px;
+    border-radius: 5px;
+    cursor: pointer;
+    width: 100%;
+    text-align: left;
+}
+
+.memory-files button:hover {
+    background-color: #61dafb;
+    color: #20232a;
+}
+
+.memory-content {
+    margin-top: 10px;
+}
+
+.loading {
+    font-size: 1.5rem;
+    margin-top: 50px;
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+    .container {
+        flex-direction: column;
+    }
+
+    .left-panel, .right-panel {
+        width: 100%;
+    }
+}
