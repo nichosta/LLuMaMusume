@@ -56,12 +56,40 @@ function App() {
             <main className="container">
                 <div className="left-panel">
                     <section className="agent-reasoning">
-                        <h3>Agent Reasoning</h3>
-                        <pre>{data.log?.thinking || 'No reasoning available.'}</pre>
+                        <h3>Agent Thinking</h3>
+                        <pre>{data.log?.agent?.thinking || 'No thinking available.'}</pre>
                     </section>
                     <section className="tool-calls">
-                        <h3>Tool Calls</h3>
-                        <pre>{(data.log?.tool_calls && JSON.stringify(data.log.tool_calls, null, 2)) || 'No tool calls.'}</pre>
+                        <h3>Actions Taken</h3>
+                        <div className="actions">
+                            {data.log?.agent?.memory_actions && data.log.agent.memory_actions.length > 0 && (
+                                <div className="memory-actions">
+                                    <h4>Memory Files:</h4>
+                                    <ul>
+                                        {data.log.agent.memory_actions.map((action, idx) => (
+                                            <li key={idx}>
+                                                <strong>{action.name}</strong>
+                                                {action.filename && `: ${action.filename}`}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                </div>
+                            )}
+                            {data.log?.agent?.input_action && (
+                                <div className="input-action">
+                                    <h4>Button Pressed:</h4>
+                                    <p>
+                                        <strong>{data.log.agent.input_action.name}</strong>
+                                        {data.log.agent.input_action.arguments?.name &&
+                                            ` (${data.log.agent.input_action.arguments.name})`}
+                                    </p>
+                                </div>
+                            )}
+                            {(!data.log?.agent?.memory_actions || data.log.agent.memory_actions.length === 0) &&
+                             !data.log?.agent?.input_action && (
+                                <p>No actions taken.</p>
+                            )}
+                        </div>
                     </section>
                 </div>
                 <div className="right-panel">
