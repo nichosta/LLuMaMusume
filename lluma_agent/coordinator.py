@@ -411,10 +411,12 @@ class GameLoopCoordinator:
                 menus_screenshot=capture_result.menus_path,
             )
             turn_log["agent"] = {
-                "reasoning": turn_result.reasoning,
                 "thinking": turn_result.thinking,
                 "memory_actions": [
-                    {"name": a["name"], "args_keys": list(a["arguments"].keys())}
+                    {
+                        "name": a["name"],
+                        "filename": a["arguments"].get("name", None),
+                    }
                     for a in turn_result.memory_actions
                 ],
                 "input_action": turn_result.input_action,

@@ -38,11 +38,21 @@ $env:OPENROUTER_API_KEY='your-key-here'
 
 ### Basic Run
 
+To run the agent and the web UI, you first need to build the frontend:
+```bash
+cd lluma_web/frontend
+npm install
+npm run build
+cd ../..
+```
+
+Then, you can start the main application:
 ```bash
 python main.py
 ```
 
 The agent will:
+- Start a web server to view agent activity at http://localhost:5000
 - Position and focus the game window
 - Take screenshots each turn
 - Process vision data (button detection, menu analysis)

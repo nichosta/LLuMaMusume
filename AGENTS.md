@@ -377,6 +377,25 @@ Structured logs aid debugging and reproducibility without exposing sensitive dat
   - Levels: error, warn, info (default), debug, trace.
   - Debug/trace may include intermediate Vision prompts (text only) and crop rectangles.
 
+# Web Interface
+
+The `lluma_web` directory contains a React-based frontend for monitoring the agent in real-time.
+
+## Features
+- **Live Dashboard**: View the current turn, agent thinking, and tool calls.
+- **Screenshot**: See the latest game screenshot captured by the agent.
+- **Memory Management**: Inspect and toggle memory files.
+
+## Running the Frontend
+The frontend is built with React and communicates with a backend server via Socket.IO.
+To run the frontend in development mode:
+1. Navigate to `lluma_web/frontend`.
+2. Run `npm start`.
+3. Open [http://localhost:3000](http://localhost:3000) to view it in the browser.
+
+## Styling
+The UI uses a modern dark theme with a responsive layout, built with standard CSS variables for easy customization.
+
 # Setup & Dependencies
 
 Install Python 3.13.8 (x64), then install dependencies via `uv pip install -r requirements.txt`.
